@@ -1,84 +1,68 @@
 project(
-  'KNLMeansCL',
+  'KNLMeansVk',
   'cpp',
-  default_options: ['cpp_std=c++14', 'buildtype=release'],
-  license: 'GPL-3',
-  version: '1.3',
+  default_options: ['cpp_std=c++20', 'buildtype=release'],
+  license: 'GPL-3.0-or-later',
+  version: '2.0',
 )
 
 version_parts = meson.project_version().split('.')
-major = version_parts[0]
-minor = version_parts[1]
 
-add_project_arguments('-DKNL_MAJOR_VERSION=' + major, language: 'cpp')
-add_project_arguments('-DKNL_MINOR_VERSION=' + minor, language: 'cpp')
-add_project_arguments('-DKNL_VERSION_STRING="' + meson.project_version() + '"', language: 'cpp')
+add_project_arguments('-DKNLMVK_MAJOR_VERSION=' + version_parts[0], language: 'cpp')
+add_project_arguments('-DKNLMVK_MINOR_VERSION=' + version_parts[1], language: 'cpp')
 
-enable_vs = get_option('enable_vs')
-enable_avs = get_option('enable_avs')
+cpp = meson.get_compiler('cpp')
+py = import('python').find_installation(pure: false)
 
-if not enable_vs and not enable_avs
-  error('At least one of enable_vs or enable_avs must be true.')
-endif
-
-is_static = get_option('static')
-
-opencl_dep = dependency('OpenCL', required: false)
-if not opencl_dep.found()
-  opencl_dep = meson.get_compiler('cpp').find_library('OpenCL')
-endif
-boost_dep = dependency('boost', modules: ['filesystem', 'system'], static: is_static)
-
-link_args = []
-if is_static and host_machine.system() == 'linux'
-  link_args += ['-static-libgcc', '-static-libstdc++']
-endif
-
-common_deps = [opencl_dep, boost_dep]
-if host_machine.system() == 'windows'
-  cpp = meson.get_compiler('cpp')
-  common_deps += cpp.find_library('cfgmgr32')
-  common_deps += cpp.find_library('runtimeobject', required: false)
-endif
-
-# Shared sources (kernel + utilities) used by both plugins
-shared_src = [
-  'KNLMeansCL/NLMDefault.h',
-  'KNLMeansCL/NLMKernel.cpp',
-  'KNLMeansCL/NLMKernel.h',
-  'KNLMeansCL/shared/common.cpp',
-  'KNLMeansCL/shared/common.h',
-  'KNLMeansCL/shared/ocl_utils.cpp',
-  'KNLMeansCL/shared/ocl_utils.h',
-  'KNLMeansCL/shared/startchar.cpp',
-  'KNLMeansCL/shared/startchar.h',
-]
-
-lib_src = shared_src
-lib_inc = []
-
-if enable_vs
-  py = import('python').find_installation(pure: false)
-
+# VapourSynth headers (R80+, for VSVulkan4.h): an explicit path wins, the Python package
+# provides them otherwise.
+vs_include = get_option('vapoursynth_include')
+if vs_include == ''
   r = run_command(
     py,
     '-c', 'import vapoursynth as vs; print(vs.get_include())',
     check: true,
   )
-  lib_inc += include_directories(r.stdout().strip())
-  lib_src += ['KNLMeansCL/NLMVapoursynth.cpp', 'KNLMeansCL/NLMVapoursynth.h']
+  vs_include = r.stdout().strip()
 endif
 
-if enable_avs
-  lib_inc += include_directories('KNLMeansCL/avisynth')
-  lib_src += ['KNLMeansCL/NLMAvisynth.cpp', 'KNLMeansCL/NLMAvisynth.h']
+# Only the Vulkan headers are needed: the plugin never links the loader, the VapourSynth
+# core hands it every entry point already resolved.
+deps = []
+inc_dirs = [include_directories('.')]
+inc_dirs += include_directories(vs_include)
+vulkan_include = get_option('vulkan_include')
+if vulkan_include != ''
+  inc_dirs += include_directories(vulkan_include)
+else
+  vulkan_dep = dependency('vulkan', required: false)
+  if vulkan_dep.found()
+    deps += vulkan_dep.partial_dependency(compile_args: true, includes: true)
+  elif not cpp.has_header('vulkan/vulkan.h')
+    error('Vulkan headers not found; install them or pass -Dvulkan_include=path/to/include')
+  endif
 endif
+
+link_args = []
+if get_option('static') and host_machine.system() == 'linux'
+  link_args += ['-static-libgcc', '-static-libstdc++']
+endif
+
+# The kernel is embedded with C23 #embed where the compiler has it; this generated raw
+# string header is the fallback for everything else (MSVC, older gcc).
+shader_header = custom_target(
+  'shader_comp_h',
+  input: 'lib/shader.comp',
+  output: 'shader_comp.h',
+  command: [py, files('lib/embed_shader.py'), '@INPUT@', '@OUTPUT@'],
+)
 
 library(
-  'KNLMeansCL',
-  lib_src,
-  include_directories: lib_inc,
-  dependencies: common_deps,
+  'knlmvulkan',
+  ['lib/knlmvulkan.cpp', shader_header],
+  include_directories: inc_dirs,
+  dependencies: deps,
   link_args: link_args,
+  gnu_symbol_visibility: 'hidden',
   install: false,
 )

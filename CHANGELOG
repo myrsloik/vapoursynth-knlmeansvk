@@ -1,3 +1,17 @@
+v2.0
+  - Port from OpenCL to the VapourSynth Vulkan GPU API (API 4.3); all OpenCL code removed.
+    Frames stay GPU resident through the filter, CPU clips are uploaded automatically.
+  - Plugin renamed: namespace 'knlmvk', function 'KNLMeans' (was knlm.KNLMeansCL).
+  - Removed parameters: device_type, device_id, ocl_x, ocl_y, ocl_r (the core owns the
+    device), info, mode_9_to_15bits (one normalization path covers every integer depth).
+  - Remove AviSynth support; the port is built on VapourSynth's GPU API.
+  - Fix stale temporal data being read during the last 'd' frames of a clip; the search
+    window now shrinks symmetrically at both clip ends.
+  - Frames process concurrently (fmParallel with per-frame scratch) instead of
+    serializing through one command queue.
+  - Remove the 8192x8192 resolution limit and the OpenCL/Boost build dependencies; only
+    the Vulkan headers are needed to compile.
+
 v1.3
   - Improve device selection logic.
     Cover more invalid value return from macOS during auto device selection.

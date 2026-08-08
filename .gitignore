@@ -7,9 +7,6 @@
 *.userosscache
 *.sln.docstates
 
-# Khronos OpenCL files download separately
-OpenCL/
-
 # User-specific files (MonoDevelop/Xamarin Studio)
 *.userprefs
 
@@ -254,9 +251,6 @@ paket-files/
 # JetBrains Rider
 .idea/
 *.sln.iml
-/KNLMeansCL/KNLMeansCL.vcxproj
-/KNLMeansCL/KNLMeansCL.vcxproj.filters
-/KNLMeansCL.sln
 
 # junk
 .DS_Store
@@ -278,7 +272,6 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
 lib64/
 parts/
 sdist/
@@ -478,5 +471,3 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
-# vcpkg
-vcpkg_installed/

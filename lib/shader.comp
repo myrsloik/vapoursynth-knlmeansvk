@@ -1,0 +1,270 @@
+/*
+ * This file is part of KNLMeansVk,
+ * Copyright(C) 2015-2020 Edoardo Brunetti (the OpenCL kernels this derives from),
+ * Copyright(C) 2026 the KNLMeansVk contributors.
+ *
+ * GPLv3-or-later, like the OpenCL implementation it is ported from.
+ *
+ * The GPU-friendly NL-means decomposition follows B. Goossens, H.Q. Luong, J. Aelterman,
+ * A. Pizurica and W. Philips, "A GPU-Accelerated Real-Time NLMeans Algorithm for Denoising
+ * Color Video Sequences", Proc. ACIVS (2), 2010, pp. 46-57.
+ *
+ * Not a standalone shader: the host prepends "#version 460", the storage extensions and
+ * these defines, then compiles the result once per kernel:
+ *
+ *   KNLM_KERNEL    0 zero, 1 pack, 2 distance, 3 hbox, 4 vbox, 5 accumulate, 6 finish
+ *   KNLM_CHANNELS  1, 2 or 3 jointly filtered channels
+ *   KNLM_FMT_FLOAT 1 for half/float clips, 0 for integer
+ *   SAMPLE_T       uint8_t / uint16_t / float16_t / float
+ *
+ * Everything that is a value rather than structure arrives as a specialization constant,
+ * so two instances differing only in parameters share the same cached source text.
+ *
+ * Scratch layout (all float, plane after plane, each plane scrStride * height elements):
+ *   U1 stacks: (2*RADIUS+1) * KNLM_CHANNELS planes; layer L channel c is plane L*C + c,
+ *              layer RADIUS is the frame being produced. One stack for the clip, a second
+ *              for rclip when given (distances read rclip, averages read the clip).
+ *   U4 pair:   2 planes each; slot 0 the +q weight field, slot 1 the temporal mirror.
+ *   U2:        KNLM_CHANNELS + 1 planes; weighted sums, then the weight sum.
+ *   U5:        1 plane; the running maximum weight, seeding the center pixel's weight.
+ *
+ * Spatial out-of-bounds reads are zero, reproducing the OpenCL CLK_ADDRESS_CLAMP border:
+ * patches beyond the edge compare against black and their pixels contribute value zero.
+ */
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(constant_id = 0) const int REFMODE = 0;      /* 0 luma, 1 chroma, 2 yuv, 3 rgb */
+layout(constant_id = 1) const int WMODE = 0;        /* 0 welsch, 1/2/3 bisquare a/b/c */
+layout(constant_id = 2) const int PATCH = 4;        /* s: patch radius */
+layout(constant_id = 3) const int RADIUS = 0;       /* d: temporal radius */
+layout(constant_id = 4) const float H2_INV_NORM = 1.0;
+layout(constant_id = 5) const float WREF = 1.0;
+layout(constant_id = 6) const float DENORM = 255.0; /* integer max pixel value */
+
+layout(push_constant) uniform PC {
+    int width, height;      /* processed plane, which every kernel dispatches over */
+    int scrStride;          /* scratch row length in floats, fixed at creation */
+    int dstStride;          /* finish: output plane stride in samples */
+    int srcStride0, srcStride1, srcStride2; /* pack: source plane strides in samples */
+    int qx, qy, qk;         /* the search offset; qk in [-RADIUS, 0] */
+    int layer;              /* pack: stack layer; finish: channel */
+    int numSlots;           /* distance/hbox/vbox: 1, or 2 when qk < 0 */
+    uint gate;              /* accumulate: 0 skips an offset the clip edge cannot supply */
+} pc;
+
+/* The per-frame plane area; layer/channel/slot indices scale it. */
+#define PLANE_ELEMS (pc.scrStride * pc.height)
+
+#define FLT_EPS 1.1920928955078125e-7
+
+#if KNLM_KERNEL == 0 /* ------------------------------------------------ zero U2 and U5 */
+
+layout(std430, binding = 0) writeonly buffer BU2 { float u2[]; };
+layout(std430, binding = 1) writeonly buffer BU5 { float u5[]; };
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x), y = int(gl_GlobalInvocationID.y);
+    if (x >= pc.width || y >= pc.height)
+        return;
+    int idx = y * pc.scrStride + x;
+    for (int c = 0; c <= KNLM_CHANNELS; c++)
+        u2[c * PLANE_ELEMS + idx] = 0.0;
+    /* Epsilon rather than zero so a frame whose every weight underflows still divides. */
+    u5[idx] = FLT_EPS;
+}
+
+#elif KNLM_KERNEL == 1 /* --------------------- pack one source frame into a stack layer */
+
+layout(std430, binding = 0) readonly buffer BP0 { SAMPLE_T p0[]; };
+#if KNLM_CHANNELS >= 2
+layout(std430, binding = 1) readonly buffer BP1 { SAMPLE_T p1[]; };
+#endif
+#if KNLM_CHANNELS >= 3
+layout(std430, binding = 2) readonly buffer BP2 { SAMPLE_T p2[]; };
+#endif
+layout(std430, binding = KNLM_CHANNELS) writeonly buffer BU1 { float u1[]; };
+
+float normalize1(SAMPLE_T v) {
+#if KNLM_FMT_FLOAT
+    return float(v);
+#else
+    return float(v) / DENORM;
+#endif
+}
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x), y = int(gl_GlobalInvocationID.y);
+    if (x >= pc.width || y >= pc.height)
+        return;
+    int base = pc.layer * KNLM_CHANNELS * PLANE_ELEMS + y * pc.scrStride + x;
+    u1[base] = normalize1(p0[y * pc.srcStride0 + x]);
+#if KNLM_CHANNELS >= 2
+    u1[base + PLANE_ELEMS] = normalize1(p1[y * pc.srcStride1 + x]);
+#endif
+#if KNLM_CHANNELS >= 3
+    u1[base + 2 * PLANE_ELEMS] = normalize1(p2[y * pc.srcStride2 + x]);
+#endif
+}
+
+#elif KNLM_KERNEL == 2 /* -------------------- per-pixel patch distance for one offset q */
+
+layout(std430, binding = 0) readonly buffer BU1 { float u1[]; };
+layout(std430, binding = 1) writeonly buffer BU4 { float u4[]; };
+
+float stackAt(int layer, int c, int xx, int yy) {
+    if (uint(xx) >= uint(pc.width) || uint(yy) >= uint(pc.height))
+        return 0.0;
+    return u1[(layer * KNLM_CHANNELS + c) * PLANE_ELEMS + yy * pc.scrStride + xx];
+}
+
+float channelDistance(int layerA, int layerB, int x, int y) {
+    /* The first operand is the pixel this thread owns, always in bounds. */
+    float a0 = u1[(layerA * KNLM_CHANNELS + 0) * PLANE_ELEMS + y * pc.scrStride + x];
+    float b0 = stackAt(layerB, 0, x + pc.qx, y + pc.qy);
+    if (REFMODE == 0) {
+        float d0 = a0 - b0;
+        return 3.0 * d0 * d0;
+    }
+    float a1 = u1[(layerA * KNLM_CHANNELS + 1) * PLANE_ELEMS + y * pc.scrStride + x];
+    float b1 = stackAt(layerB, 1, x + pc.qx, y + pc.qy);
+    if (REFMODE == 1) {
+        float d0 = a0 - b0, d1 = a1 - b1;
+        return 1.5 * (d0 * d0 + d1 * d1);
+    }
+    float a2 = u1[(layerA * KNLM_CHANNELS + 2) * PLANE_ELEMS + y * pc.scrStride + x];
+    float b2 = stackAt(layerB, 2, x + pc.qx, y + pc.qy);
+    float d0 = a0 - b0, d1 = a1 - b1, d2 = a2 - b2;
+    if (REFMODE == 2)
+        return d0 * d0 + d1 * d1 + d2 * d2;
+    /* RGB weights red and blue by brightness, as the OpenCL kernel did. */
+    float mRed = (a0 + b0) / 6.0;
+    return (2.0 / 3.0 + mRed) * d0 * d0 + (4.0 / 3.0) * d1 * d1 + (1.0 - mRed) * d2 * d2;
+}
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x), y = int(gl_GlobalInvocationID.y);
+    if (x >= pc.width || y >= pc.height)
+        return;
+    int idx = y * pc.scrStride + x;
+    /* Slot 0: this frame against the neighbour at +q. */
+    u4[idx] = channelDistance(RADIUS, RADIUS + pc.qk, x, y);
+    /* Slot 1: the temporal mirror, the frame at -qk against this one, whose weight the
+       accumulation reads back at (x - qx, y - qy). Same field as slot 0 when qk is 0. */
+    if (pc.numSlots == 2)
+        u4[PLANE_ELEMS + idx] = channelDistance(RADIUS - pc.qk, RADIUS, x, y);
+}
+
+#elif KNLM_KERNEL == 3 || KNLM_KERNEL == 4 /* ------- separable (2s+1) box of distances */
+
+layout(std430, binding = 0) readonly buffer BI { float bin[]; };
+layout(std430, binding = 1) writeonly buffer BO { float bout[]; };
+
+float boxAt(int base, int xx, int yy) {
+    if (uint(xx) >= uint(pc.width) || uint(yy) >= uint(pc.height))
+        return 0.0;
+    return bin[base + yy * pc.scrStride + xx];
+}
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x), y = int(gl_GlobalInvocationID.y);
+    if (x >= pc.width || y >= pc.height)
+        return;
+    for (int s = 0; s < pc.numSlots; s++) {
+        int base = s * PLANE_ELEMS;
+        float sum = 0.0;
+#if KNLM_KERNEL == 3
+        for (int j = -PATCH; j <= PATCH; j++)
+            sum += boxAt(base, x + j, y);
+        bout[base + y * pc.scrStride + x] = sum;
+#else
+        for (int j = -PATCH; j <= PATCH; j++)
+            sum += boxAt(base, x, y + j);
+        /* The vertical pass finishes the patch sum, so the weight lands here. */
+        float v = sum * H2_INV_NORM;
+        float w;
+        if (WMODE == 0)
+            w = exp(-v);
+        else {
+            float f = max(1.0 - v, 0.0);
+            if (WMODE == 1)
+                w = f;
+            else if (WMODE == 2)
+                w = f * f;
+            else {
+                float f2 = f * f, f4 = f2 * f2;
+                w = f4 * f4;
+            }
+        }
+        bout[base + y * pc.scrStride + x] = w;
+#endif
+    }
+}
+
+#elif KNLM_KERNEL == 5 /* --------------- accumulate both neighbours of the offset pair */
+
+layout(std430, binding = 0) readonly buffer BU1 { float u1[]; };
+layout(std430, binding = 1) readonly buffer BU4 { float u4[]; };
+layout(std430, binding = 2) buffer BU2 { float u2[]; };
+layout(std430, binding = 3) buffer BU5 { float u5[]; };
+
+float stackAt(int layer, int c, int xx, int yy) {
+    if (uint(xx) >= uint(pc.width) || uint(yy) >= uint(pc.height))
+        return 0.0;
+    return u1[(layer * KNLM_CHANNELS + c) * PLANE_ELEMS + yy * pc.scrStride + xx];
+}
+
+float weightAt(int slot, int xx, int yy) {
+    if (uint(xx) >= uint(pc.width) || uint(yy) >= uint(pc.height))
+        return 0.0;
+    return u4[slot * PLANE_ELEMS + yy * pc.scrStride + xx];
+}
+
+void main() {
+    /* An offset the clip edge cannot supply on both temporal sides contributes nothing;
+       the search window shrinks symmetrically at the ends of the clip. */
+    if (pc.gate == 0u)
+        return;
+    int x = int(gl_GlobalInvocationID.x), y = int(gl_GlobalInvocationID.y);
+    if (x >= pc.width || y >= pc.height)
+        return;
+    int idx = y * pc.scrStride + x;
+    float w = u4[idx];
+    /* The -q neighbour's weight is the one computed at p - q with offset +q: slot 0 when
+       the pair is spatial, the mirror slot when it spans time. */
+    float wMq = weightAt(pc.qk == 0 ? 0 : 1, x - pc.qx, y - pc.qy);
+    u5[idx] = max(max(w, wMq), u5[idx]);
+    for (int c = 0; c < KNLM_CHANNELS; c++) {
+        float uPq = stackAt(RADIUS + pc.qk, c, x + pc.qx, y + pc.qy);
+        float uMq = stackAt(RADIUS - pc.qk, c, x - pc.qx, y - pc.qy);
+        u2[c * PLANE_ELEMS + idx] += w * uPq + wMq * uMq;
+    }
+    u2[KNLM_CHANNELS * PLANE_ELEMS + idx] += w + wMq;
+}
+
+#elif KNLM_KERNEL == 6 /* -------------------- weighted average out to one output plane */
+
+layout(std430, binding = 0) readonly buffer BU1 { float u1[]; };
+layout(std430, binding = 1) readonly buffer BU2 { float u2[]; };
+layout(std430, binding = 2) readonly buffer BU5 { float u5[]; };
+layout(std430, binding = 3) writeonly buffer BD { SAMPLE_T dst[]; };
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x), y = int(gl_GlobalInvocationID.y);
+    if (x >= pc.width || y >= pc.height)
+        return;
+    int idx = y * pc.scrStride + x;
+    int c = pc.layer;
+    float center = u1[(RADIUS * KNLM_CHANNELS + c) * PLANE_ELEMS + idx];
+    float m = WREF * u5[idx];
+    float den = m + u2[KNLM_CHANNELS * PLANE_ELEMS + idx];
+    float val = (center * m + u2[c * PLANE_ELEMS + idx]) / den;
+#if KNLM_FMT_FLOAT
+    dst[y * pc.dstStride + x] = SAMPLE_T(val);
+#else
+    /* Round to nearest even and saturate, as the OpenCL convert_*_sat_rte did. */
+    dst[y * pc.dstStride + x] = SAMPLE_T(uint(clamp(roundEven(val * DENORM), 0.0, DENORM)));
+#endif
+}
+
+#endif

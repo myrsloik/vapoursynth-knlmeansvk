@@ -1,7 +1,7 @@
 [build-system]
 requires = [
     "hatchling>=1.27.0",
-    "vapoursynth>=74",
+    "vapoursynth>=80",
     "meson",
     "ninja",
     "packaging",
@@ -9,9 +9,9 @@ requires = [
 build-backend = "hatchling.build"
 
 [project]
-name = "vapoursynth-knlmeanscl"
+name = "vapoursynth-knlmeansvk"
 dynamic = ["version"]
-description = "Optimized OpenCL implementation of the Non-local means de-noising algorithm"
+description = "Non-local means de-noising on the VapourSynth Vulkan GPU device"
 readme = "README.md"
 license = "GPL-3.0-or-later"
 license-files = ["LICENSE"]
@@ -20,15 +20,15 @@ authors = [{ name = "Edoardo Brunetti", email = "edo.brunetti@gmail.com" }]
 maintainers = [
     { name = "Jaded Encoding Thaumaturgy", email = "jaded.encoding.thaumaturgy@gmail.com" },
 ]
-dependencies = ["vapoursynth>=74"]
+dependencies = ["vapoursynth>=80"]
 
 [dependency-groups]
 dev = ["hatchling>=1.27.0", "packaging"]
 
 [project.urls]
-"Source Code" = "https://github.com/Jaded-Encoding-Thaumaturgy/vapoursynth-knlmeanscl"
-"Bug Tracker" = "https://github.com/Jaded-Encoding-Thaumaturgy/vapoursynth-knlmeanscl/issues"
-"Changelog" = "https://github.com/Jaded-Encoding-Thaumaturgy/vapoursynth-knlmeanscl/blob/master/CHANGELOG"
+"Source Code" = "https://github.com/Jaded-Encoding-Thaumaturgy/vapoursynth-knlmeansvk"
+"Bug Tracker" = "https://github.com/Jaded-Encoding-Thaumaturgy/vapoursynth-knlmeansvk/issues"
+"Changelog" = "https://github.com/Jaded-Encoding-Thaumaturgy/vapoursynth-knlmeansvk/blob/master/CHANGELOG"
 "Contact" = "https://discord.gg/XTpc6Fa9eB"
 
 [tool.hatch.version]
@@ -36,7 +36,7 @@ path = "meson.build"
 pattern = "version\\s*:\\s*'(?P<version>\\d+\\.\\d+)'"
 
 [tool.hatch.build.targets.sdist]
-include = ["KNLMeansCL", "meson.build", "meson_options.txt"]
+include = ["lib", "meson.build", "meson_options.txt"]
 
 [tool.hatch.build.targets.wheel]
 include = ["vapoursynth/plugins"]

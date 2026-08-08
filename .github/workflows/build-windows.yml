@@ -8,57 +8,27 @@ on:
 jobs:
   build:
     runs-on: windows-latest
-    env:
-      VCPKG_INSTALLATION_ROOT: C:\vcpkg
 
     steps:
       - uses: actions/checkout@v6
 
-      # MSVC must be set up before vcpkg so any from-source compilation uses the right toolchain.
       - name: Setup MSVC dev environment
         uses: ilammy/msvc-dev-cmd@v1
 
       - name: Setup uv
         uses: astral-sh/setup-uv@v8.0.0
 
-      - name: Cache vcpkg packages
-        uses: actions/cache@v5
-        with:
-          path: vcpkg_installed
-          key: ${{ runner.os }}-vcpkg-x64-${{ hashFiles('vcpkg.json') }}
-          restore-keys: ${{ runner.os }}-vcpkg-x64-
+      - name: Fetch Vulkan headers
+        run: git clone --depth 1 https://github.com/KhronosGroup/Vulkan-Headers.git vulkan-headers
 
-      - name: Install vcpkg packages
+      - name: Build wheel
         shell: pwsh
         run: |
-          vcpkg install `
-            --triplet x64-windows-static `
-            --x-install-root=vcpkg_installed
-
-          # Expose pkgconf as pkg-config on PATH
-          $toolsDir = "${{ github.workspace }}\vcpkg_installed\x64-windows-static\tools\pkgconf"
-          if (Test-Path "$toolsDir\pkgconf.exe") {
-            if (-not (Test-Path "$toolsDir\pkg-config.exe")) {
-              Copy-Item "$toolsDir\pkgconf.exe" "$toolsDir\pkg-config.exe" -Force
-            }
-          }
-          "$toolsDir" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-        env:
-          VCPKG_ROOT: ${{ env.VCPKG_INSTALLATION_ROOT }}
-
-      - name: Meson setup and build
-        shell: pwsh
-        run: |
-          $vcpkgRoot = "${{ github.workspace }}\vcpkg_installed\x64-windows-static"
-          $env:LIB = "$vcpkgRoot\lib;$env:LIB"
-          $env:INCLUDE = "$vcpkgRoot\include;$env:INCLUDE"
-          $env:PKG_CONFIG_PATH = "$vcpkgRoot\lib\pkgconfig"
-          $env:BOOST_ROOT = "$vcpkgRoot"
-          $env:MESON_ARGS = "-Db_vscrt=mt -Denable_avs=false -Dstatic=true"
+          $env:MESON_ARGS = "-Db_vscrt=mt -Dvulkan_include=$PWD\vulkan-headers\include"
           uv build --wheel
 
       - name: Upload VapourSynth plugin
         uses: actions/upload-artifact@v7
         with:
-          name: knlmeanscl-vs-windows-x64
+          name: knlmeansvk-vs-windows-x64
           path: dist/*

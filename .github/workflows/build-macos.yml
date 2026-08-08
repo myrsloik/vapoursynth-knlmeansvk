@@ -19,24 +19,8 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Setup uv
-        uses: astral-sh/setup-uv@v8.0.0
-
-      - name: Cache vcpkg packages
-        uses: actions/cache@v5
-        with:
-          path: |
-            vcpkg_installed
-          key: ${{ runner.os }}-vcpkg-${{ matrix.arch }}-${{ hashFiles('vcpkg.json') }}
-          restore-keys: ${{ runner.os }}-vcpkg-${{ matrix.arch }}-
-
-      - name: Install vcpkg packages
-        run: |
-          vcpkg install \
-            --triplet ${{ matrix.arch == 'macosx_arm64' && 'arm64' || 'x64' }}-osx \
-            --x-install-root=vcpkg_installed
-        env:
-          VCPKG_ROOT: /usr/local/share/vcpkg
+      - name: Fetch Vulkan headers
+        run: git clone --depth 1 https://github.com/KhronosGroup/Vulkan-Headers.git vulkan-headers
 
       - name: Build wheels
         uses: pypa/cibuildwheel@v3.4
@@ -44,9 +28,7 @@ jobs:
           CIBW_BUILD: cp312-*
           CIBW_BUILD_FRONTEND: uv
           CIBW_ENVIRONMENT_MACOS: >
-            MESON_ARGS="-Denable_avs=false -Dstatic=true"
-            PKG_CONFIG_PATH="${{ github.workspace }}/vcpkg_installed/${{ matrix.arch == 'macosx_arm64' && 'arm64' || 'x64' }}-osx/lib/pkgconfig"
-            BOOST_ROOT="${{ github.workspace }}/vcpkg_installed/${{ matrix.arch == 'macosx_arm64' && 'arm64' || 'x64' }}-osx"
+            MESON_ARGS="-Dvulkan_include=${{ github.workspace }}/vulkan-headers/include"
             MACOSX_DEPLOYMENT_TARGET=15
         with:
           extras: uv
@@ -54,5 +36,5 @@ jobs:
       - name: Upload VapourSynth plugin
         uses: actions/upload-artifact@v7
         with:
-          name: knlmeanscl-vs-macos-${{ matrix.arch }}
+          name: knlmeansvk-vs-macos-${{ matrix.arch }}
           path: ./wheelhouse/*.whl

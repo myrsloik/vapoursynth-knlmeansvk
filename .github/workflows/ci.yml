@@ -30,7 +30,7 @@ jobs:
 
     environment:
       name: pypi
-      url: https://pypi.org/p/vapoursynth-knlmeanscl
+      url: https://pypi.org/p/vapoursynth-knlmeansvk
 
     steps:
       - name: Checkout repository

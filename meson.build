@@ -48,8 +48,14 @@ if get_option('static') and host_machine.system() == 'linux'
   link_args += ['-static-libgcc', '-static-libstdc++']
 endif
 
-# The kernel is embedded with C23 #embed where the compiler has it; this generated raw
-# string header is the fallback for everything else (MSVC, older gcc).
+# The kernel is embedded as a generated raw string header.
+#
+# The source can also embed it with C23 #embed, and does when compiled by hand, but the
+# build turns that off deliberately: nothing tells ninja that an object depends on a file
+# reached through #embed, and meson attaches a generated header to a target as an
+# order-only dependency, so with #embed active an edited shader rebuilt NOTHING and the
+# tests silently re-ran the old binary. Going through the header puts shader_comp.h in the
+# compiler's depfile, which is what makes an incremental build correct.
 shader_header = custom_target(
   'shader_comp_h',
   input: 'lib/shader.comp',
@@ -62,6 +68,7 @@ library(
   ['lib/knlmvulkan.cpp', shader_header],
   include_directories: inc_dirs,
   dependencies: deps,
+  cpp_args: ['-DKNLMVK_NO_EMBED'],
   link_args: link_args,
   gnu_symbol_visibility: 'hidden',
   install: false,

@@ -40,8 +40,10 @@
 #include "gpufilter.h"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -79,26 +81,37 @@ const char knlmGlsl[] = {
 #endif
 
 /* Kernel ids, matching KNLM_KERNEL in shader.comp and the program list order. */
-enum Kernel { kZero, kPack, kDistance, kHBox, kVBox, kAccumulate, kFinish, kNumKernels };
+enum Kernel { kZero, kPack, kWeight, kAccumulate, kFinish, kNumKernels };
 
-/* Must mirror the push_constant block in shader.comp field for field. */
-struct KPush {
+/* The search runs in rounds of up to this many offsets per dispatch, dividing the
+   dispatch and barrier count by the batch size. Eight triple-int offsets is what fits the
+   128-byte push constant floor beside the round header. KNLMVK_BATCH=1..8 overrides the
+   batch size per instance, mostly for measuring. */
+constexpr int maxBatch = 8;
+
+/* Must mirror the two push_constant blocks in shader.comp field for field. */
+struct SearchPush {
+    int32_t width, height;
+    int32_t scrStride;
+    int32_t numPairs;
+    uint32_t gateMask;
+    int32_t qx[maxBatch], qy[maxBatch], qk[maxBatch];
+};
+static_assert(sizeof(SearchPush) <= 128, "push constants have a 128 byte floor");
+
+struct BasePush {
     int32_t width, height;
     int32_t scrStride;
     int32_t dstStride;
     int32_t srcStride0, srcStride1, srcStride2;
-    int32_t qx, qy, qk;
     int32_t layer;
-    int32_t numSlots;
-    uint32_t gate;
 };
 
 /* One entry per pass, consulted by fillPush. */
 struct PMeta {
     Kernel kind = kZero;
-    int qx = 0, qy = 0, qk = 0;
-    int layer = 0; /* pack: stack layer; finish: channel */
-    int slots = 1;
+    int layer = 0;                         /* pack: stack layer; finish: channel */
+    std::vector<std::array<int, 3>> pairs; /* search rounds: their (qx, qy, qk) */
 };
 
 std::string composeKernel(int kernel, int channels, const VSVideoFormat &fmt) {
@@ -117,6 +130,7 @@ std::string composeKernel(int kernel, int channels, const VSVideoFormat &fmt) {
     s += "#define KNLM_KERNEL " + std::to_string(kernel) + "\n" +
         "#define KNLM_CHANNELS " + std::to_string(channels) + "\n" +
         "#define KNLM_FMT_FLOAT " + (isFloat ? "1" : "0") + "\n" +
+        "#define KNLM_MAX_BATCH " + std::to_string(maxBatch) + "\n" +
         "#define SAMPLE_T " + sampleType + "\n";
     s += knlmGlsl;
     return s;
@@ -258,10 +272,70 @@ static void VS_CC KNLMeansCreate(const VSMap *in, VSMap *out, void *, VSCore *co
     const bool temporal = dTmp > 0;
     const int C = numChannels;
 
+    /* The half-window offsets, in the OpenCL enqueue order, then cut into rounds. */
+    std::vector<std::array<int, 3>> offsets;
+    {
+        const int side = 2 * aTmp + 1, area = side * side;
+        for (int k = -dTmp; k <= 0; k++)
+            for (int j = -aTmp; j <= aTmp; j++)
+                for (int i = -aTmp; i <= aTmp; i++)
+                    if (k * area + j * side + i < 0)
+                        offsets.push_back({ i, j, k });
+    }
+
     /* Scratch rows use their own stride: 64 floats keeps rows 256-byte aligned and
        independent of whatever stride the output plane's sample size produces. */
     const int scrStride = (procW + 63) & ~63;
     const VkDeviceSize planeBytes = static_cast<VkDeviceSize>(scrStride) * procH * sizeof(float);
+
+    /* Round size. Before the weight kernel was fused this tracked cache residency, since
+       the box passes re-read the weight plane once per tap; now it is written once and
+       read about twice, and the measured optimum stopped following any rule worth
+       encoding -- on the test card the best batch is 4 at 720p and 1080p, 2 at 1440p and
+       8 at 2160p, which is not even monotonic. A flat 4 is the best or within a few
+       percent of it at every one of those, and a residency rule fitted to the old
+       behaviour was 40% off at 2160p. KNLMVK_BATCH=1..8 overrides per machine. */
+    int batch = 4;
+    if (const char *forced = std::getenv("KNLMVK_BATCH"))
+        batch = std::clamp(std::atoi(forced), 1, maxBatch);
+    const int pairsMax = static_cast<int>(std::min<size_t>(batch, offsets.size()));
+
+    /* Output rows per thread in the weight kernel: the more a tile covers, the less of
+       its halo is recomputed border, but the more shared memory a workgroup holds and so
+       the fewer of them stay resident. Four is where the two meet -- measured at 1080p,
+       234 fps against 182 at one row and 178 at eight, and eight is what a
+       "largest that fits shared memory" rule would have chosen. Smaller values exist only
+       as a fallback for a device too small for four, which needs 15 KiB at the largest
+       patch and so is within the 16 KiB Vulkan guarantees. KNLMVK_ROWS overrides. */
+    uint32_t sharedLimit = 16384;
+    {
+        char verr[512] = {};
+        VSVulkanCoreHandles vh;
+        const VSVULKANAPI *vkapi = vsapi->getVulkanAPI(VSVULKAN_API_VERSION);
+        const VSVulkanFunctions *vk = vkapi ? vkapi->getVulkanFunctions(core, verr, sizeof(verr)) : nullptr;
+        if (vk && !vkapi->getVulkanHandles(core, &vh, verr, sizeof(verr))) {
+            VkPhysicalDeviceProperties2 props = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
+            vk->vkGetPhysicalDeviceProperties2(vh.physicalDevice, &props);
+            sharedLimit = props.properties.limits.maxComputeSharedMemorySize;
+        }
+        /* An unusable GPU API is reported with a proper message by createFilter. */
+    }
+    auto sharedBytesFor = [&](int rows) {
+        const uint32_t padW = 16 + 2 * static_cast<uint32_t>(sTmp);
+        const uint32_t padH = 16 * static_cast<uint32_t>(rows) + 2 * static_cast<uint32_t>(sTmp);
+        return static_cast<uint32_t>((padH * padW + padH * 16) * sizeof(float));
+    };
+    int rows = 1;
+    for (int r : { 4, 2, 1 }) {
+        if (sharedBytesFor(r) <= sharedLimit) {
+            rows = r;
+            break;
+        }
+    }
+    if (const char *forced = std::getenv("KNLMVK_ROWS"))
+        rows = std::clamp(std::atoi(forced), 1, 8);
+    if (sharedBytesFor(rows) > sharedLimit)
+        return fail("the patch radius needs more shared memory than this device has");
 
     vsgpu::FilterDesc desc;
     desc.vi = *vi;
@@ -280,17 +354,16 @@ static void VS_CC KNLMeansCreate(const VSMap *in, VSMap *out, void *, VSCore *co
     const int slotU1a = 0;
     const int slotU1b = haveRef ? 1 : -1;
     const int slotU4a = haveRef ? 2 : 1;
-    const int slotU4b = slotU4a + 1;
-    const int slotU2 = slotU4b + 1;
+    const int slotU2 = slotU4a + 1;
     const int slotU5 = slotU2 + 1;
     desc.scratchCount = slotU5 + 1;
     desc.scratchDefs.resize(static_cast<size_t>(desc.scratchCount));
     desc.scratchDefs[slotU1a] = { static_cast<VkDeviceSize>(T) * C * planeBytes, 0 };
     if (haveRef)
         desc.scratchDefs[slotU1b] = { static_cast<VkDeviceSize>(T) * C * planeBytes, 0 };
-    desc.scratchDefs[slotU4a] = { 2 * planeBytes, 0 };
-    desc.scratchDefs[slotU4b] = { 2 * planeBytes, 0 };
-    desc.scratchDefs[slotU2] = { static_cast<VkDeviceSize>(C + 1) * planeBytes, 0 };
+    desc.scratchDefs[slotU4a] = { static_cast<VkDeviceSize>(pairsMax) * 2 * planeBytes, 0 };
+    /* U2 is interleaved and widened to a power of two; see U2VEC in the kernel. */
+    desc.scratchDefs[slotU2] = { static_cast<VkDeviceSize>(C == 1 ? 2 : 4) * planeBytes, 0 };
     desc.scratchDefs[slotU5] = { planeBytes, 0 };
 
     /* Programs: the same source text specialized per kernel; parameters that are values
@@ -300,21 +373,23 @@ static void VS_CC KNLMeansCreate(const VSMap *in, VSMap *out, void *, VSCore *co
     const float h2InvNorm = static_cast<float>(255.0 * 255.0 / (3.0 * h * h * sSize));
     const float maxVal = fmt.sampleType == stInteger
         ? static_cast<float>((1 << fmt.bitsPerSample) - 1) : 1.0f;
-    const int storageCounts[kNumKernels] = { 2, C + 1, 2, 2, 2, 4, 4 };
+    const int storageCounts[kNumKernels] = { 2, C + 1, 2, 4, 4 };
     for (int kern = 0; kern < kNumKernels; kern++) {
+        const bool search = kern == kWeight || kern == kAccumulate;
         vsgpu::Program prog;
         prog.glsl = composeKernel(kern, C, fmt);
         prog.storageBufferCount = storageCounts[kern];
-        prog.pushConstantBytes = sizeof(KPush);
+        prog.pushConstantBytes = search ? sizeof(SearchPush) : sizeof(BasePush);
         prog.localSizeX = 16;
         prog.localSizeY = 16;
         struct SpecData {
             int32_t refMode, wmode, patch, radius;
             float h2, wref, denorm;
-        } spec = { refMode, wmode, sTmp, dTmp, h2InvNorm, static_cast<float>(wref), maxVal };
+            int32_t rows;
+        } spec = { refMode, wmode, sTmp, dTmp, h2InvNorm, static_cast<float>(wref), maxVal, rows };
         prog.specData.assign(reinterpret_cast<const uint8_t *>(&spec),
             reinterpret_cast<const uint8_t *>(&spec) + sizeof(spec));
-        for (uint32_t i = 0; i < 7; i++)
+        for (uint32_t i = 0; i < 8; i++)
             prog.specEntries.push_back({ i, i * 4, 4 });
         desc.programs.push_back(std::move(prog));
     }
@@ -355,64 +430,36 @@ static void VS_CC KNLMeansCreate(const VSMap *in, VSMap *out, void *, VSCore *co
         }
     }
 
-    /* The search loop: one distance/box/box/accumulate round per half-window offset,
-       exactly the OpenCL enqueue order (which fixes the float summation order too). */
+    /* The search, in rounds of up to `batch` offsets: one weight pass and one accumulate
+       pass cover a whole round. The offsets keep the OpenCL enqueue order; within a round
+       the accumulate sums its pairs in registers before touching U2, which only regroups
+       the float additions. */
     const int distStack = haveRef ? slotU1b : slotU1a;
-    const int side = 2 * aTmp + 1, area = side * side;
-    for (int k = -dTmp; k <= 0; k++) {
-        for (int j = -aTmp; j <= aTmp; j++) {
-            for (int i = -aTmp; i <= aTmp; i++) {
-                if (k * area + j * side + i >= 0)
-                    continue;
-                const int slots = k ? 2 : 1;
-                PMeta m;
-                m.qx = i;
-                m.qy = j;
-                m.qk = k;
-                m.slots = slots;
-                {
-                    vsgpu::Pass pass;
-                    pass.program = kDistance;
-                    pass.bindings.push_back(vsgpu::Operand::scratch(distStack));
-                    pass.bindings.push_back(vsgpu::Operand::scratch(slotU4a));
-                    gateHeavy(pass);
-                    desc.passes.push_back(std::move(pass));
-                    m.kind = kDistance;
-                    meta.push_back(m);
-                }
-                {
-                    vsgpu::Pass pass;
-                    pass.program = kHBox;
-                    pass.bindings.push_back(vsgpu::Operand::scratch(slotU4a));
-                    pass.bindings.push_back(vsgpu::Operand::scratch(slotU4b));
-                    gateHeavy(pass);
-                    desc.passes.push_back(std::move(pass));
-                    m.kind = kHBox;
-                    meta.push_back(m);
-                }
-                {
-                    vsgpu::Pass pass;
-                    pass.program = kVBox;
-                    pass.bindings.push_back(vsgpu::Operand::scratch(slotU4b));
-                    pass.bindings.push_back(vsgpu::Operand::scratch(slotU4a));
-                    gateHeavy(pass);
-                    desc.passes.push_back(std::move(pass));
-                    m.kind = kVBox;
-                    meta.push_back(m);
-                }
-                {
-                    vsgpu::Pass pass;
-                    pass.program = kAccumulate;
-                    pass.bindings.push_back(vsgpu::Operand::scratch(slotU1a));
-                    pass.bindings.push_back(vsgpu::Operand::scratch(slotU4a));
-                    pass.bindings.push_back(vsgpu::Operand::scratch(slotU2));
-                    pass.bindings.push_back(vsgpu::Operand::scratch(slotU5));
-                    gateHeavy(pass);
-                    desc.passes.push_back(std::move(pass));
-                    m.kind = kAccumulate;
-                    meta.push_back(m);
-                }
-            }
+    for (size_t o = 0; o < offsets.size(); o += static_cast<size_t>(batch)) {
+        const size_t oEnd = std::min(o + static_cast<size_t>(batch), offsets.size());
+        std::vector<std::array<int, 3>> round(offsets.begin() + o, offsets.begin() + oEnd);
+        const std::pair<Kernel, std::vector<int>> roundPasses[2] = {
+            { kWeight, { distStack, slotU4a } },
+            { kAccumulate, { slotU1a, slotU4a, slotU2, slotU5 } },
+        };
+        for (const auto &[kern, slots] : roundPasses) {
+            vsgpu::Pass pass;
+            pass.program = kern;
+            for (int slot : slots)
+                pass.bindings.push_back(vsgpu::Operand::scratch(slot));
+            gateHeavy(pass);
+            /* The weight kernel emits ROWS rows per thread, so its grid is that much
+               shorter; it bounds its stores against the real dimensions, which fillPush
+               passes from creation-time constants rather than from the reshaped grid. */
+            if (kern == kWeight && rows > 1)
+                pass.reshape = [rows](vsgpu::PassInfo &info) {
+                    info.height = (info.height + rows - 1) / rows;
+                };
+            desc.passes.push_back(std::move(pass));
+            PMeta m;
+            m.kind = kern;
+            m.pairs = round;
+            meta.push_back(std::move(m));
         }
     }
 
@@ -448,34 +495,39 @@ static void VS_CC KNLMeansCreate(const VSMap *in, VSMap *out, void *, VSCore *co
     };
 
     const int scrStrideV = scrStride;
-    desc.fillPush = [meta, scrStrideV](const vsgpu::PassInfo &info, void *pushData) {
+    desc.fillPush = [meta, scrStrideV, procW, procH](const vsgpu::PassInfo &info, void *pushData) {
         const PMeta &m = meta[info.pass];
-        KPush push = {};
+        if (m.kind == kWeight || m.kind == kAccumulate) {
+            SearchPush push = {};
+            /* Creation-time dimensions, not info's: the weight pass reshapes its grid. */
+            push.width = procW;
+            push.height = procH;
+            push.scrStride = scrStrideV;
+            push.numPairs = static_cast<int32_t>(m.pairs.size());
+            const int kv = static_cast<int>(info.frameParams[0]);
+            for (size_t p = 0; p < m.pairs.size(); p++) {
+                push.qx[p] = m.pairs[p][0];
+                push.qy[p] = m.pairs[p][1];
+                push.qk[p] = m.pairs[p][2];
+                if (std::abs(m.pairs[p][2]) <= kv)
+                    push.gateMask |= 1u << p;
+            }
+            std::memcpy(pushData, &push, sizeof(push));
+            return;
+        }
+        BasePush push = {};
         push.width = static_cast<int32_t>(info.width);
         push.height = static_cast<int32_t>(info.height);
         push.scrStride = scrStrideV;
-        push.qx = m.qx;
-        push.qy = m.qy;
-        push.qk = m.qk;
         push.layer = m.layer;
-        push.numSlots = m.slots;
-        push.gate = 1;
-        switch (m.kind) {
-        case kPack:
+        if (m.kind == kPack) {
             push.srcStride0 = static_cast<int32_t>(info.strideElements[0]);
             if (info.bindingCount > 2)
                 push.srcStride1 = static_cast<int32_t>(info.strideElements[1]);
             if (info.bindingCount > 3)
                 push.srcStride2 = static_cast<int32_t>(info.strideElements[2]);
-            break;
-        case kAccumulate:
-            push.gate = std::abs(m.qk) <= static_cast<int>(info.frameParams[0]) ? 1u : 0u;
-            break;
-        case kFinish:
+        } else if (m.kind == kFinish) {
             push.dstStride = static_cast<int32_t>(info.dstStrideElements());
-            break;
-        default:
-            break;
         }
         std::memcpy(pushData, &push, sizeof(push));
     };

@@ -80,6 +80,12 @@ carries over.
 - No 8192x8192 resolution limit (it came from OpenCL image dimensions).
 - AviSynth support was removed together with OpenCL: the port is built on VapourSynth's
   GPU API.
+- The `ocl_x`/`ocl_y`/`ocl_r` tuning knobs are gone. The three kernels the OpenCL
+  implementation used per search offset — pixel distance, horizontal box, vertical box —
+  are one fused kernel here whose intermediates stay in shared memory, each thread emits
+  several output rows, and several search offsets share a dispatch. `KNLMVK_BATCH` (1-8,
+  offsets per round) and `KNLMVK_ROWS` (1-8, output rows per thread) retune the last two
+  on hardware unlike the one they were measured on.
 
 ## Compilation
 
@@ -109,3 +115,6 @@ Wheels build with [uv](https://github.com/astral-sh/uv): `uv build --wheel`.
 This project is licensed under the GNU General Public License v3.0 or later (GPLv3+),
 like the KNLMeansCL implementation it is ported from, Copyright© 2015-2020
 Edoardo Brunetti.
+
+The fused weight kernel follows the structure of the CUDA NLMeans in
+[vapoursynth-zipcu](https://github.com/dnjulek/vapoursynth-zipcu) by dnjulek (MIT).

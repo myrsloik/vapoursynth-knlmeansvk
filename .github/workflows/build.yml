@@ -64,10 +64,14 @@ jobs:
     - name: Fetch Vulkan headers
       run: git clone --depth 1 https://github.com/KhronosGroup/Vulkan-Headers.git "$env:RUNNER_TEMP\vulkan-headers"
 
-    # b_vscrt=mt so the plugin carries no dependency on the redistributable runtime.
+    # b_vscrt=mt so the plugin carries no dependency on the redistributable runtime. Forward
+    # slashes because hatch_build.py splits MESON_ARGS with shlex in POSIX mode, where a
+    # backslash is an escape character and a Windows path silently loses its separators;
+    # meson accepts either form.
     - name: Build
       run: |
-        $env:MESON_ARGS = "-Db_vscrt=mt -Dvulkan_include=$env:RUNNER_TEMP\vulkan-headers\include"
+        $vulkanInclude = "$env:RUNNER_TEMP\vulkan-headers\include".Replace('\', '/')
+        $env:MESON_ARGS = "-Db_vscrt=mt -Dvulkan_include=$vulkanInclude"
         uv build
 
     - uses: actions/upload-artifact@v7

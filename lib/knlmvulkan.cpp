@@ -311,7 +311,7 @@ static void VS_CC KNLMeansCreate(const VSMap *in, VSMap *out, void *, VSCore *co
     {
         char verr[512] = {};
         VSVulkanCoreHandles vh;
-        const VSVULKANAPI *vkapi = vsapi->getVulkanAPI(VSVULKAN_API_VERSION);
+        const VSVULKANAPI *vkapi = vsapi->getVulkanAPI();
         const VSVulkanFunctions *vk = vkapi ? vkapi->getVulkanFunctions(core, verr, sizeof(verr)) : nullptr;
         if (vk && !vkapi->getVulkanHandles(core, &vh, verr, sizeof(verr))) {
             VkPhysicalDeviceProperties2 props = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };

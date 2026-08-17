@@ -1,7 +1,7 @@
 [build-system]
 requires = [
     "hatchling>=1.27.0",
-    "vapoursynth>=80",
+    "vapoursynth>=80a1",
     "meson",
     "ninja",
     "packaging",
@@ -20,7 +20,7 @@ authors = [{ name = "Edoardo Brunetti", email = "edo.brunetti@gmail.com" }]
 maintainers = [
     { name = "Jaded Encoding Thaumaturgy", email = "jaded.encoding.thaumaturgy@gmail.com" },
 ]
-dependencies = ["vapoursynth>=80"]
+dependencies = ["vapoursynth>=80a1"]
 
 [dependency-groups]
 dev = ["hatchling>=1.27.0", "packaging"]

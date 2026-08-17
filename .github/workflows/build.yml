@@ -38,8 +38,10 @@ jobs:
           git clone --depth 1 https://github.com/KhronosGroup/Vulkan-Headers.git /tmp/vulkan-headers
         CIBW_ENVIRONMENT_LINUX: MESON_ARGS="-Dstatic=true -Dvulkan_include=/opt/vulkan-headers/include"
         CIBW_ENVIRONMENT_MACOS: MESON_ARGS="-Dvulkan_include=/tmp/vulkan-headers/include" MACOSX_DEPLOYMENT_TARGET=15
-        CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_34
-        CIBW_MANYLINUX_AARCH64_IMAGE: manylinux_2_34
+        # No manylinux image pin: cibuildwheel then builds in the image whose policy it also
+        # repairs against, so the two cannot disagree. Pinning one to manylinux_2_34 produced a
+        # binary auditwheel rejected for referencing symbols newer than that policy allows.
+        CIBW_SKIP: "*-musllinux*"
       with:
         output-dir: dist
         extras: uv

@@ -171,13 +171,15 @@ static void VS_CC KNLMeansCreate(const VSMap *in, VSMap *out, void *, VSCore *co
             return fail("'rclip' does not match the source clip");
     }
 
-    int dTmp = static_cast<int>(vsapi->mapGetInt(in, "d", 0, &err));
+    /* Saturated reads, so an out-of-range value fails the checks below instead of
+       wrapping into a valid one. */
+    int dTmp = vsapi->mapGetIntSaturated(in, "d", 0, &err);
     if (err)
         dTmp = 1;
-    int aTmp = static_cast<int>(vsapi->mapGetInt(in, "a", 0, &err));
+    int aTmp = vsapi->mapGetIntSaturated(in, "a", 0, &err);
     if (err)
         aTmp = 2;
-    int sTmp = static_cast<int>(vsapi->mapGetInt(in, "s", 0, &err));
+    int sTmp = vsapi->mapGetIntSaturated(in, "s", 0, &err);
     if (err)
         sTmp = 4;
     double h = vsapi->mapGetFloat(in, "h", 0, &err);
@@ -186,7 +188,7 @@ static void VS_CC KNLMeansCreate(const VSMap *in, VSMap *out, void *, VSCore *co
     const char *channels = vsapi->mapGetData(in, "channels", 0, &err);
     if (err)
         channels = "AUTO";
-    int wmode = static_cast<int>(vsapi->mapGetInt(in, "wmode", 0, &err));
+    int wmode = vsapi->mapGetIntSaturated(in, "wmode", 0, &err);
     if (err)
         wmode = 0;
     double wref = vsapi->mapGetFloat(in, "wref", 0, &err);
@@ -199,12 +201,25 @@ static void VS_CC KNLMeansCreate(const VSMap *in, VSMap *out, void *, VSCore *co
         return fail("'a' must be greater than or equal to 1");
     if (sTmp < 0 || sTmp > 8)
         return fail("'s' must be in range [0, 8]");
-    if (h <= 0.0)
+    /* Negated comparisons so NaN fails too; NaN in either would make every output NaN. */
+    if (!(h > 0.0))
         return fail("'h' must be greater than 0");
     if (wmode < 0 || wmode > 3)
         return fail("'wmode' must be in range [0, 3]");
-    if (wref < 0.0)
+    if (!(wref >= 0.0))
         return fail("'wref' must be greater than or equal to 0");
+
+    /* Every search offset becomes a pass list entry copied into two per-pass records, so
+       an absurd window would eat host memory and creation time rather than fail. A
+       million offsets is far beyond any useful setting (the defaults give 37) and still
+       bounded; arithmetic in 64 bits since (2a+1)^2 overflows int at a = 23170. */
+    {
+        const int64_t side = 2 * static_cast<int64_t>(aTmp) + 1;
+        const int64_t numOffsets = (side * side * (2 * static_cast<int64_t>(dTmp) + 1) - 1) / 2;
+        if (numOffsets > (int64_t(1) << 20))
+            return fail("'a' and 'd' give " + std::to_string(numOffsets) +
+                " search offsets; the limit is " + std::to_string(int64_t(1) << 20));
+    }
 
     auto chanIs = [&](const char *what) {
         const char *a = channels, *b = what;
@@ -308,7 +323,7 @@ static void VS_CC KNLMeansCreate(const VSMap *in, VSMap *out, void *, VSCore *co
         const VkDeviceSize planeElems = static_cast<VkDeviceSize>(scrStride) * procH;
         const VkDeviceSize largest = std::max<VkDeviceSize>(T * C, 2 * pairsMax) * planeElems;
         if (largest >= (VkDeviceSize(1) << 31))
-            return fail("'d' is too large for this resolution: the temporal stack exceeds 2^31 elements");
+            return fail("the frame size and 'd' together need a scratch buffer of more than 2^31 elements");
     }
 
     /* Output rows per thread in the weight kernel: the more a tile covers, the less of

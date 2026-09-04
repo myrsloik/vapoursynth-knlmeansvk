@@ -300,6 +300,17 @@ static void VS_CC KNLMeansCreate(const VSMap *in, VSMap *out, void *, VSCore *co
         batch = std::clamp(std::atoi(forced), 1, maxBatch);
     const int pairsMax = static_cast<int>(std::min<size_t>(batch, offsets.size()));
 
+    /* The kernels index scratch with 32-bit ints, so the largest buffer -- the stack,
+       or U4 for a tiny 'd' with a big batch -- must stay under 2^31 floats. Nothing
+       reasonable comes near it (8K RGB needs d > 10, at 8 GB of scratch per frame), so
+       this only turns a silent wraparound into a message. */
+    {
+        const VkDeviceSize planeElems = static_cast<VkDeviceSize>(scrStride) * procH;
+        const VkDeviceSize largest = std::max<VkDeviceSize>(T * C, 2 * pairsMax) * planeElems;
+        if (largest >= (VkDeviceSize(1) << 31))
+            return fail("'d' is too large for this resolution: the temporal stack exceeds 2^31 elements");
+    }
+
     /* Output rows per thread in the weight kernel: the more a tile covers, the less of
        its halo is recomputed border, but the more shared memory a workgroup holds and so
        the fewer of them stay resident. Four is where the two meet -- measured at 1080p,
@@ -314,7 +325,7 @@ static void VS_CC KNLMeansCreate(const VSMap *in, VSMap *out, void *, VSCore *co
         const VSVULKANAPI *vkapi = vsapi->getVulkanAPI();
         const VSVulkanFunctions *vk = vkapi ? vkapi->getVulkanFunctions(core, verr, sizeof(verr)) : nullptr;
         if (vk && !vkapi->getVulkanHandles(core, &vh, verr, sizeof(verr))) {
-            VkPhysicalDeviceProperties2 props = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
+            VkPhysicalDeviceProperties2 props = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, nullptr, {} };
             vk->vkGetPhysicalDeviceProperties2(vh.physicalDevice, &props);
             sharedLimit = props.properties.limits.maxComputeSharedMemorySize;
         }
@@ -409,7 +420,7 @@ static void VS_CC KNLMeansCreate(const VSMap *in, VSMap *out, void *, VSCore *co
         pass.bindings.push_back(vsgpu::Operand::scratch(slotU5));
         gateHeavy(pass);
         desc.passes.push_back(std::move(pass));
-        meta.push_back({ kZero });
+        meta.push_back(PMeta{});
     }
 
     /* Pack the temporal stacks; layers write disjoint ranges, so no barriers between. */

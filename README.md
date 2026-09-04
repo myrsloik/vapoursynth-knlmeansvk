@@ -72,7 +72,11 @@ carries over.
 - The plugin namespace is `knlmvk` and the function `KNLMeans`, replacing
   `knlm.KNLMeansCL`.
 - The filter runs `fmParallel` with per-frame GPU scratch instead of serializing frames
-  through one command queue, so concurrent frames actually overlap.
+  through one command queue, so concurrent frames actually overlap. The price is that
+  every frame in flight holds its own scratch: `(2d+1)` float planes per filtered channel
+  (twice that with `rclip`) plus about a dozen more, roughly 1 GB per frame at 4K RGB with
+  `d=3`. The core runs up to one frame per thread, so on a card that runs out of memory
+  lower `core.num_threads` or `d` rather than expecting the filter to slow down.
 - At the last `d` frames of a clip the OpenCL implementation read stale stack layers for
   the future temporal side. Here the temporal window shrinks symmetrically at both clip
   ends instead, mirroring its start-of-clip behaviour; every interior frame is

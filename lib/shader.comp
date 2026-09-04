@@ -227,6 +227,11 @@ void main() {
     int gx = bx + lx;
 
     for (int p = 0; p < pc.numPairs; p++) {
+        /* A gated-out pair is never read by the accumulation, so its weights need not be
+           computed. The mask is a push constant, so this is uniform and the barriers below
+           stay in uniform control flow. */
+        if ((pc.gateMask & (1u << p)) == 0u)
+            continue;
         int slots = pc.qk[p] < 0 ? 2 : 1;
         for (int s = 0; s < slots; s++) {
             /* Slot 0 is this frame against the neighbour at +q; slot 1 the temporal
@@ -344,7 +349,10 @@ void main() {
     float m = WREF * u5[idx];
     U2VEC v = u2[idx];
     float den = m + v[KNLM_CHANNELS];
-    float val = (center * m + v[c]) / den;
+    /* The bisquare kernels cut off to exactly zero, so a pixel with no similar neighbour
+       and wref = 0 has nothing to average; it keeps its own value rather than 0/0. Every
+       other case leaves den > 0 and takes the plain division, as the original did. */
+    float val = den > 0.0 ? (center * m + v[c]) / den : center;
 #if KNLM_FMT_FLOAT
     dst[y * pc.dstStride + x] = SAMPLE_T(val);
 #else

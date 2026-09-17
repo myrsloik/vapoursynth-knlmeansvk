@@ -68,7 +68,9 @@ library(
   ['lib/knlmvulkan.cpp', shader_header],
   include_directories: inc_dirs,
   dependencies: deps,
-  cpp_args: ['-DKNLMVK_NO_EMBED'],
+  # _CRT_SECURE_NO_WARNINGS: the MSVC runtime otherwise deprecates the getenv behind the
+  # tuning overrides on every Windows compiler; a no-op elsewhere.
+  cpp_args: ['-DKNLMVK_NO_EMBED', '-D_CRT_SECURE_NO_WARNINGS'],
   link_args: link_args,
   gnu_symbol_visibility: 'hidden',
   install: false,

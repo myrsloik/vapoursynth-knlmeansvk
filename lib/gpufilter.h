@@ -39,6 +39,7 @@
 
 #include "VapourSynth4.h"
 #include "VSVulkan4.h"
+#include "vsgpuglsl.h"
 
 #include <algorithm>
 #include <cstring>
@@ -51,7 +52,8 @@ namespace vsgpu {
 
 /* Bindings per pass. Sized for the widest thing in the tree: AverageFrames takes up to 31
    input clips plus the output. The program list itself is unbounded; a program only costs
-   its pipeline. */
+   its pipeline. This bounds the arrays; how many the device binds in one pass is its own
+   number, which createFilter checks every program against. */
 constexpr int maxBindings = 32;
 
 /* What a pass binds at one descriptor slot. Never a VkBuffer: the driver resolves these to
@@ -225,11 +227,14 @@ struct FilterDesc {
     /* Optional, run before any push constants are filled: fills frameParamCount uint32s
        from the source frames themselves. Needed whenever a kernel parameter is a property
        of the frame rather than of the filter -- field order read from _Field, say, which is
-       not known until the frame arrives. Returning false fails the frame with the message.
-       The parameters live on the stack of the call, so this stays reentrant. */
+       not known until the frame arrives. scratch is this frame's handoff to
+       prepareFrameData: driver owned, empty on entry, delivered to the sibling call for
+       the same frame and to nothing else, for state that is expensive or outright wrong
+       to compute twice. Returning false fails the frame with the message. The parameters
+       and the scratch live on the stack of the call, so this stays reentrant. */
     int frameParamCount = 0;
     std::function<bool(int n, const VSFrame *const *sources, int numSources,
-        const VSAPI *vsapi, uint32_t *params, std::string &error)> prepareFrame;
+        const VSAPI *vsapi, uint32_t *params, std::vector<uint8_t> &scratch, std::string &error)> prepareFrame;
 
     /* prepareFrame's big sibling: per-frame data too large for a push constant block, staged
        to device local memory ahead of the first pass -- a frame property array feeding an
@@ -237,11 +242,12 @@ struct FilterDesc {
        have arrived, so it can read their properties, and fills frameDataBytes bytes straight
        into the staging buffer; the driver copies that into a device local buffer bound through
        Operand::frameData() and fences the copy against the first dispatch. Both buffers are
-       per frame and retire with the submission, so concurrent frames never share. Returning
-       false fails the frame with the message. */
+       per frame and retire with the submission, so concurrent frames never share. scratch
+       is whatever this frame's prepareFrame left in its handoff, empty without one.
+       Returning false fails the frame with the message. */
     uint32_t frameDataBytes = 0;
     std::function<bool(int n, const VSFrame *const *sources, int numSources,
-        const VSAPI *vsapi, void *data, std::string &error)> prepareFrameData;
+        const VSAPI *vsapi, void *data, const std::vector<uint8_t> &scratch, std::string &error)> prepareFrameData;
 
     /* A filter that computes something about frames rather than new planes -- PlaneStats
        -- declares itself a side effect: every plane is shared through untouched, and the
@@ -272,38 +278,92 @@ struct FilterDesc {
 
 namespace detail {
 
+/* Every operand is bound as a whole buffer, so its size is its descriptor's range, and the
+   device caps the range. The message for a binding past the cap; exact is false when the size
+   is a lower bound rather than the number the buffer will have. */
+inline std::string pastStorageRange(const std::string &what, VkDeviceSize bytes, VkDeviceSize limit, bool exact) {
+    return what + (exact ? " is " : " is at least ") + std::to_string(bytes) +
+        " bytes, but this device binds at most " + std::to_string(limit) + " bytes as one storage buffer";
+}
+
+inline std::string operandName(const Operand &op, int plane) {
+    switch (op.kind) {
+    case Operand::SourcePlane:
+        return "clip " + std::to_string(op.clip) + " plane " + std::to_string(op.plane >= 0 ? op.plane : plane);
+    case Operand::OutputPlane:
+        return "output plane " + std::to_string(plane);
+    case Operand::Scratch:
+        return "scratch buffer " + std::to_string(op.slot);
+    case Operand::Constant:
+        return "constant buffer " + std::to_string(op.slot);
+    case Operand::Readback:
+        return "the readback buffer";
+    default:
+        return "the frame data buffer";
+    }
+}
+
 struct Instance {
     FilterDesc desc;
     const VSVULKANAPI *vkapi = nullptr;
     const VSVulkanFunctions *vk = nullptr;
     VSVulkanCoreHandles handles = {};
     VSGPUExecPool *pool = nullptr;
-    /* The pool's timeline, kept raw for the per submission readback waits; the pool owns
-       it and outlives every use here. */
-    VkSemaphore poolTimelineSem = VK_NULL_HANDLE;
     std::vector<VkDescriptorSetLayout> setLayouts;
     std::vector<VkPipelineLayout> pipeLayouts;
     std::vector<VkPipeline> pipelines;
     std::vector<VSGPUBuffer *> constantBuffers;
     std::vector<VSVulkanBufferInfo> constantInfo;
+    /* The device's cap on a storage descriptor's range, which for a whole-buffer binding is
+       the buffer's size. Queried at create, applied to every binding. */
+    VkDeviceSize maxStorageBufferRange = 0;
 
     ~Instance() {
         if (!vk)
             return;
-        /* The pool drains the device before it returns, so anything a submission was
-           still reading is safe to destroy only after this point. */
-        if (pool)
-            vkapi->freeGPUExecPool(pool);
-        for (VSGPUBuffer *b : constantBuffers)
-            vkapi->destroyGPUBuffer(b);
-        for (size_t i = 0; i < pipelines.size(); i++) {
-            if (pipelines[i])
-                vk->vkDestroyPipeline(handles.device, pipelines[i], nullptr);
-            if (pipeLayouts[i])
-                vk->vkDestroyPipelineLayout(handles.device, pipeLayouts[i], nullptr);
-            if (setLayouts[i])
-                vk->vkDestroyDescriptorSetLayout(handles.device, setLayouts[i], nullptr);
+        /* Drain first so nothing a submission still uses is destroyed under it; the pool is
+           freed last because its device reference is the only thing here guaranteed to keep
+           vk and handles.device alive through the destruction below.
+
+           A drain that fails establishes nothing: the recording is still queued and may still be
+           bound to the pipelines and reading the constants below, so none of it is destroyed in
+           that case. Leaking is the same trade the readback path here makes when its own drain
+           fails, and the one the core's pool destructor makes with its command pools. It is
+           over-conservative in exactly one case -- a device reset, where nothing is executing
+           and all of it could go -- which the public API gives a filter no way to recognise;
+           that case ends in a restart anyway. A pool that never existed drained
+           trivially. */
+        bool drained = true;
+        if (pool) {
+            char err[512] = { 0 };
+            /* A reset counts as drained, and has to: nothing is executing after one, so all of
+               this is safe to destroy -- while treating it as undrained would strand the pool,
+               everything it retained, and the device itself, whose only reference here is the
+               pool's. That is a leak nothing ever collects, once per filter instance, for the
+               rest of the process. */
+            drained = vsGPUDrainSafeToDestroy(vkapi->gpuExecPoolWaitIdle(pool, err, sizeof(err)));
         }
+        if (drained) {
+            for (VSGPUBuffer *b : constantBuffers)
+                vkapi->destroyGPUBuffer(b);
+            for (size_t i = 0; i < pipelines.size(); i++) {
+                if (pipelines[i])
+                    vk->vkDestroyPipeline(handles.device, pipelines[i], nullptr);
+                if (pipeLayouts[i])
+                    vk->vkDestroyPipelineLayout(handles.device, pipeLayouts[i], nullptr);
+                if (setLayouts[i])
+                    vk->vkDestroyDescriptorSetLayout(handles.device, setLayouts[i], nullptr);
+            }
+        }
+        /* Only when the drain established completion. What was left above holds no device
+           reference of its own, and the pool's is the only thing keeping handles.device alive,
+           so freeing it here would let vkDestroyDevice run with those pipelines still live --
+           including after a reset, where the pool's own destructor takes the completed branch
+           and releases its timeline. Leaking the pool with them keeps the device up for as long
+           as they exist, which is what the core's pool destructor achieves by leaking its
+           timeline on the same path. */
+        if (pool && drained)
+            vkapi->freeGPUExecPool(pool);
     }
 };
 
@@ -418,10 +478,13 @@ inline const VSFrame *VS_CC driverGetFrame(int n, int activationReason, void *in
 
     /* Local, so concurrent frames on this node never see each other's parameters. */
     std::vector<uint32_t> frameParams(static_cast<size_t>(desc.frameParamCount));
+    /* The per frame handoff between prepareFrame and prepareFrameData; lives here so the
+       pair share exactly one frame's state and nothing rides in globals. */
+    std::vector<uint8_t> frameScratch;
     if (desc.prepareFrame) {
         std::string prepareError;
         if (!desc.prepareFrame(n, sourceFrames.data(), static_cast<int>(sourceFrames.size()),
-                vsapi, frameParams.data(), prepareError)) {
+                vsapi, frameParams.data(), frameScratch, prepareError)) {
             vsapi->setFilterError(prepareError.c_str(), frameCtx);
             releaseSources();
             vsapi->freeFrame(dst);
@@ -540,7 +603,7 @@ inline const VSFrame *VS_CC driverGetFrame(int n, int activationReason, void *in
         inst->vkapi->gpuExecUsesBuffer(ctx, staging);
         std::string prepareError;
         if (!desc.prepareFrameData(n, sourceFrames.data(), static_cast<int>(sourceFrames.size()),
-                vsapi, frameDataStaging.mapped, prepareError))
+                vsapi, frameDataStaging.mapped, frameScratch, prepareError))
             return frameDataFail(prepareError.c_str());
     }
 
@@ -620,6 +683,7 @@ inline const VSFrame *VS_CC driverGetFrame(int n, int activationReason, void *in
             for (size_t b = 0; b < pass.bindings.size(); b++) {
                 const Operand &op = pass.bindings[b];
                 VkBuffer buffer = VK_NULL_HANDLE;
+                VkDeviceSize bytes = 0;
                 uint32_t strideElems = dstStrideElems;
                 if (op.kind == Operand::SourcePlane) {
                     const VSFrame *srcFrame = fetch(op.clip, op.frameOffset);
@@ -636,6 +700,7 @@ inline const VSFrame *VS_CC driverGetFrame(int n, int activationReason, void *in
                         break;
                     }
                     buffer = planeInfo.buffer;
+                    bytes = planeInfo.bufferSize;
                     /* Each source is measured in its own sample size, not the output's:
                        Expr accepts clips whose format differs from what it writes, and
                        dividing an 8 bit source's stride by a 16 bit output would halve it. */
@@ -643,18 +708,31 @@ inline const VSFrame *VS_CC driverGetFrame(int n, int activationReason, void *in
                     strideElems = static_cast<uint32_t>(vsapi->getStride(srcFrame, srcPlane) / srcFmt->bytesPerSample);
                 } else if (op.kind == Operand::OutputPlane) {
                     buffer = dstPlane.buffer;
+                    bytes = dstPlane.bufferSize;
                 } else if (op.kind == Operand::Constant) {
                     buffer = inst->constantInfo[op.slot].buffer;
+                    bytes = inst->constantInfo[op.slot].size;
                     info.addresses[b] = inst->constantInfo[op.slot].address;
                 } else if (op.kind == Operand::Readback) {
                     buffer = readbackInfo.buffer;
+                    bytes = readbackInfo.size;
                     info.addresses[b] = readbackInfo.address;
                 } else if (op.kind == Operand::FrameData) {
                     buffer = frameDataInfo.buffer;
+                    bytes = frameDataInfo.size;
                     info.addresses[b] = frameDataInfo.address;
                 } else {
                     buffer = scratch[op.slot].buffer;
+                    bytes = scratch[op.slot].size;
                     info.addresses[b] = scratch[op.slot].address;
+                }
+                /* Bound whole, so the size is the range and the range is what the device caps.
+                   The sizes a filter declares were refused at create; a plane's was only bounded
+                   from below there, the row padding being the core's, and a variable source's
+                   not at all, so this is the exact check. */
+                if (bytes > inst->maxStorageBufferRange) {
+                    bindError = "GPU filter: " + pastStorageRange(operandName(op, p), bytes, inst->maxStorageBufferRange, true);
+                    break;
                 }
                 info.strideElements[b] = strideElems;
                 bufferInfo[b].buffer = buffer;
@@ -720,6 +798,24 @@ inline const VSFrame *VS_CC driverGetFrame(int n, int activationReason, void *in
         }
     }
 
+    /* The host reads the readback buffer below, and a completed submission does not by itself
+       put the kernel's writes in the host's reach -- the same availability operation
+       VSVulkanTransfer::downloadPlanes submits before reading a plane straight out of its
+       mapping. Recorded after every pass, so it covers whichever of them wrote the buffer. */
+    if (readbackBuffer) {
+        VkMemoryBarrier2 mb = {};
+        mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+        mb.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        mb.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+        mb.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT;
+        mb.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
+        VkDependencyInfo dep = {};
+        dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+        dep.memoryBarrierCount = 1;
+        dep.pMemoryBarriers = &mb;
+        inst->vk->vkCmdPipelineBarrier2(cmd, &dep);
+    }
+
     uint64_t signaled = 0;
     if (inst->vkapi->gpuExecSubmit(ctx, readbackBuffer ? &signaled : nullptr, err, sizeof(err))) {
         vsapi->setFilterError((std::string("GPU filter: ") + err).c_str(), frameCtx);
@@ -731,17 +827,27 @@ inline const VSFrame *VS_CC driverGetFrame(int n, int activationReason, void *in
     }
 
     if (readbackBuffer) {
-        /* Wait for exactly this frame's submission on the pool timeline -- concurrent
-           frames keep their own submissions flowing -- then let the filter finish the
-           reduction on the host and write its properties. */
-        VkSemaphoreWaitInfo waitInfo = {};
-        waitInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
-        waitInfo.semaphoreCount = 1;
-        waitInfo.pSemaphores = &inst->poolTimelineSem;
-        waitInfo.pValues = &signaled;
-        if (inst->vk->vkWaitSemaphores(inst->handles.device, &waitInfo, UINT64_MAX) != VK_SUCCESS) {
-            vsapi->setFilterError("GPU filter: waiting for the readback failed", frameCtx);
-            inst->vkapi->destroyGPUBuffer(readbackBuffer);
+        /* Wait for exactly this frame's submission -- concurrent frames keep their own
+           submissions flowing -- then let the filter finish the reduction on the host and
+           write its properties. Through the API rather than vkWaitSemaphores directly, so a
+           reset that force-signalled the timeline is reported instead of being read as a
+           completed dispatch, and an allocation failure inside the wait is retried. */
+        const int waited = inst->vkapi->gpuExecWaitValue(inst->pool, signaled, err, sizeof(err));
+        if (waited != gdDrained) {
+            /* err, not a fixed string: the whole reason this goes through the API is that it
+               can tell a reset from a wait that gave up, and saying so is the half the script
+               actually sees. */
+            vsapi->setFilterError((std::string("GPU filter: the readback did not complete: ") + err).c_str(), frameCtx);
+            /* The submission is queued and may still be writing this buffer -- the wait
+               failing says nothing about the GPU being done -- so its region must not go
+               back to the allocator until the pool has drained, or the next allocation
+               gets bytes a live dispatch is still writing. A drain that fails too means
+               the device is gone, and leaking one buffer beats recycling it under that
+               write. Every other per-frame buffer avoids this by riding the context,
+               which this one cannot: the host reads its mapping after the submission. */
+            if (vsGPUDrainSafeToDestroy(waited) ||
+                    vsGPUDrainSafeToDestroy(inst->vkapi->gpuExecPoolWaitIdle(inst->pool, err, sizeof(err))))
+                inst->vkapi->destroyGPUBuffer(readbackBuffer);
             releaseSources();
             vsapi->freeFrame(dst);
             return nullptr;
@@ -856,6 +962,78 @@ inline VSNode *createFilter(const char *name, const FilterDesc &desc, const VSFi
     if (!inst->vk)
         return fail(err);
 
+    /* Every operand is bound as a whole buffer, so its size is its descriptor's range, and
+       every pass pushes one storage buffer per binding into one set. The device caps both,
+       and a descriptor past a cap is not an error anything reports: it is undefined behaviour
+       that surfaces as garbage or a device loss somewhere else entirely. maxBindings only
+       sizes the arrays; the device's own numbers are applied here, once, so a filter this
+       device cannot run is refused at creation with the reason. Neither cap is theoretical:
+       the specification guarantees a range of only 128 MB, which one 8K float plane exceeds,
+       and Vulkan on Metal reports 31 storage buffers per stage without argument buffers, one
+       short of AverageFrames at its widest. */
+    VkPhysicalDevicePushDescriptorProperties pushProps = {};
+    pushProps.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PUSH_DESCRIPTOR_PROPERTIES;
+    VkPhysicalDeviceProperties2 props = {};
+    props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+    props.pNext = &pushProps;
+    inst->vk->vkGetPhysicalDeviceProperties2(inst->handles.physicalDevice, &props);
+    const VkPhysicalDeviceLimits &limits = props.properties.limits;
+    /* One set of storage buffers in one compute stage, so all three counts cap the same
+       number. */
+    const uint32_t maxStorageBuffers = std::min({ limits.maxPerStageDescriptorStorageBuffers,
+        limits.maxDescriptorSetStorageBuffers, pushProps.maxPushDescriptors });
+    for (size_t idx = 0; idx < desc.programs.size(); idx++) {
+        if (static_cast<uint32_t>(desc.programs[idx].storageBufferCount) > maxStorageBuffers)
+            return fail("program " + std::to_string(idx) + " declares " +
+                std::to_string(desc.programs[idx].storageBufferCount) + " storage buffers, but this device binds at most " +
+                std::to_string(maxStorageBuffers) + " in one pass");
+    }
+    /* The sizes the filter declares are exact. A plane's is known here only from below, the
+       row padding being the core's, so planes are bounded here and checked exactly where they
+       are bound; a variable source has no size until its frame arrives. Only what a pass
+       actually binds is looked at, since a plane that is shared through is never bound. */
+    const VkDeviceSize maxRange = inst->maxStorageBufferRange = limits.maxStorageBufferRange;
+    for (int i = 0; i < desc.scratchCount && i < static_cast<int>(desc.scratchDefs.size()); i++)
+        if (desc.scratchDefs[i].bytes > maxRange)
+            return fail(detail::pastStorageRange("scratch buffer " + std::to_string(i), desc.scratchDefs[i].bytes, maxRange, true));
+    for (size_t i = 0; i < desc.constants.size(); i++)
+        if (desc.constants[i].size() > maxRange)
+            return fail(detail::pastStorageRange("constant buffer " + std::to_string(i), desc.constants[i].size(), maxRange, true));
+    if (desc.readbackBytes > maxRange)
+        return fail(detail::pastStorageRange("the readback buffer", desc.readbackBytes, maxRange, true));
+    if (desc.frameDataBytes > maxRange)
+        return fail(detail::pastStorageRange("the frame data buffer", desc.frameDataBytes, maxRange, true));
+    auto planeBytesAtLeast = [](const VSVideoInfo &vi, int plane) -> VkDeviceSize {
+        const int w = plane ? vi.width >> vi.format.subSamplingW : vi.width;
+        const int h = plane ? vi.height >> vi.format.subSamplingH : vi.height;
+        return static_cast<VkDeviceSize>(w) * static_cast<VkDeviceSize>(vi.format.bytesPerSample) * static_cast<VkDeviceSize>(h);
+    };
+    for (int p = 0; p < (desc.sideEffect ? 1 : desc.vi.format.numPlanes); p++) {
+        if (!desc.sideEffect && !desc.process[p])
+            continue;
+        for (const Pass &pass : desc.passes) {
+            if (!pass.planes[p])
+                continue;
+            for (const Operand &op : pass.bindings) {
+                VkDeviceSize bytes = 0;
+                if (op.kind == Operand::OutputPlane) {
+                    bytes = planeBytesAtLeast(desc.vi, p);
+                } else if (op.kind == Operand::SourcePlane) {
+                    const VSVideoInfo *svi = vsapi->getVideoInfo(desc.nodes[op.clip]);
+                    const int srcPlane = op.plane >= 0 ? op.plane : p;
+                    if (svi->format.colorFamily == cfUndefined || svi->width <= 0 || svi->height <= 0 ||
+                            srcPlane >= svi->format.numPlanes)
+                        continue;
+                    bytes = planeBytesAtLeast(*svi, srcPlane);
+                } else {
+                    continue;
+                }
+                if (bytes > maxRange)
+                    return fail(detail::pastStorageRange(detail::operandName(op, p), bytes, maxRange, false));
+            }
+        }
+    }
+
     inst->setLayouts.resize(desc.programs.size(), VK_NULL_HANDLE);
     inst->pipeLayouts.resize(desc.programs.size(), VK_NULL_HANDLE);
     inst->pipelines.resize(desc.programs.size(), VK_NULL_HANDLE);
@@ -948,7 +1126,6 @@ inline VSNode *createFilter(const char *name, const FilterDesc &desc, const VSFi
     inst->pool = inst->vkapi->createGPUExecPool(core, vqCompute, err, sizeof(err));
     if (!inst->pool)
         return fail(err);
-    inst->poolTimelineSem = inst->vkapi->getGPUTimelineSemaphore(inst->vkapi->gpuExecPoolTimeline(inst->pool));
 
     /* Constants are staged and copied once, here, so every frame afterwards reads device
        local memory. The staging buffer is handed to the context, which destroys it when the
@@ -992,6 +1169,20 @@ inline VSNode *createFilter(const char *name, const FilterDesc &desc, const VSFi
         copyInfo.regionCount = 1;
         copyInfo.pRegions = &region;
         inst->vk->vkCmdCopyBuffer2(inst->vkapi->gpuExecCommandBuffer(ctx), &copyInfo);
+        /* The device side dependency for every later dispatch that reads the constants: the
+           waitIdle below only orders the host, and a host wait is not a memory dependency,
+           so without this the transfer write is never made visible to shader reads. */
+        VkMemoryBarrier2 mb = {};
+        mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+        mb.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+        mb.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        mb.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        mb.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+        VkDependencyInfo dep = {};
+        dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+        dep.memoryBarrierCount = 1;
+        dep.pMemoryBarriers = &mb;
+        inst->vk->vkCmdPipelineBarrier2(inst->vkapi->gpuExecCommandBuffer(ctx), &dep);
         if (inst->vkapi->gpuExecSubmit(ctx, nullptr, err, sizeof(err)))
             return fail(err);
     }
@@ -1024,7 +1215,11 @@ inline VSNode *createFilter(const char *name, const FilterDesc &desc, const VSFi
    layout -- drop to FilterDesc directly; the two compose, since this only builds one. */
 
 constexpr int simpleMaxInputs = 3;
-constexpr int simpleFloatParams = 32; /* enough for a 5x5 convolution matrix */
+/* Sized to the largest consumers left -- Levels uses eight floats, MaskedMerge seven
+   uints -- because the whole block has to stay inside Vulkan's guaranteed 128 byte push
+   constant minimum. Convolution, which this once reserved a 5x5 matrix for, bakes its
+   coefficients into the kernel text instead. */
+constexpr int simpleFloatParams = 8;
 constexpr int simpleUintParams = 8;
 /* Emitted into the kernel and handed to Program, so the declared workgroup and the dispatch
    arithmetic always come from the same number. */
@@ -1038,6 +1233,7 @@ struct SimplePush {
     float f[simpleFloatParams];
     uint32_t u[simpleUintParams];
 };
+static_assert(sizeof(SimplePush) <= 128, "must fit Vulkan's guaranteed 128 byte push constant minimum");
 
 struct SimpleFilter {
     const char *name = nullptr;
@@ -1082,9 +1278,10 @@ struct SimpleFilter {
        Match what the filter's scalar path declares. */
     int requestPattern = rpStrictSpatial;
 
-    /* Optional source frame index mapping and per frame parameters, named as in FilterDesc,
-       which these are assigned to directly: prepareFrame inspects the source frames and
-       produces frameParamCount uint32s, which reach fillParams and finishFrame. */
+    /* Optional source frame index mapping and per frame parameters, named as in FilterDesc:
+       prepareFrame inspects the source frames and produces frameParamCount uint32s, which
+       reach fillParams and finishFrame. It keeps a shorter signature than its FilterDesc
+       namesake -- the scratch handoff is a feature no SimpleFilter needs. */
     std::function<int(int n, int clip, int frameOffset)> mapFrame;
     int frameParamCount = 0;
     std::function<bool(int n, const VSFrame *const *sources, int numSources,
@@ -1093,14 +1290,10 @@ struct SimpleFilter {
 
 namespace detail {
 
+/* The spelling itself lives in vsgpuglsl.h now, shared with every kernel in the tree;
+   this name stays for the out of tree filters already calling it. */
 inline const char *sampleTypeName(const VSVideoFormat &f) {
-    if (f.sampleType == stFloat)
-        return f.bytesPerSample == 2 ? "float16_t" : "float";
-    /* Four byte integers are not a sample format anyone stores video in, but MakeFullDiff
-       produces one: 16 bit input widens to 17, which no longer fits two bytes. */
-    if (f.bytesPerSample == 4)
-        return "uint";
-    return f.bytesPerSample == 1 ? "uint8_t" : "uint16_t";
+    return glslElementType(f);
 }
 
 inline std::string simpleSource(const SimpleFilter &sf, const VSVideoFormat &fmt) {
@@ -1108,26 +1301,22 @@ inline std::string simpleSource(const SimpleFilter &sf, const VSVideoFormat &fmt
     /* The sources may be in a different format than the output; SRC_T covers them and
        SAMPLE_T the destination, which are the same type unless a filter says otherwise. */
     const VSVideoFormat &srcFmt = sf.srcFormat ? *sf.srcFormat : fmt;
-    const bool isHalf = (isFloat && fmt.bytesPerSample == 2) ||
-                        (srcFmt.sampleType == stFloat && srcFmt.bytesPerSample == 2);
+    /* Every type the source below can spell counts, the per input overrides included: a
+       half declared only through srcFormats would otherwise emit float16_t buffers without
+       the extension that admits them, and the kernel would not compile. */
+    bool isHalf = glslUsesFloat16(fmt) || glslUsesFloat16(srcFmt);
 
-    /* One place decides how a format is spelled, for the destination as much as for the
-       sources: a second copy of this chain is how a four byte integer output silently came
-       out declared as uint16_t. */
-    std::string s = "#version 460\n";
-    s += std::string("#define SAMPLE_T ") + sampleTypeName(fmt) + "\n";
+    /* The spelling of every format, destination and sources alike, comes from the shared
+       helper so it cannot fork per filter. */
+    std::string defs = std::string("#define SAMPLE_T ") + glslElementType(fmt) + "\n";
     for (int i = 0; i < sf.numInputs; i++) {
         const VSVideoFormat &f = sf.srcFormats[i] ? *sf.srcFormats[i] : srcFmt;
-        s += "#define SRC" + std::to_string(i) + "_T " + sampleTypeName(f) + "\n";
+        isHalf = isHalf || glslUsesFloat16(f);
+        defs += "#define SRC" + std::to_string(i) + "_T " + glslElementType(f) + "\n";
     }
-    s += std::string("#define LUT_T ") + (sf.constantType ? sf.constantType : sampleTypeName(fmt)) + "\n";
+    defs += std::string("#define LUT_T ") + (sf.constantType ? sf.constantType : glslElementType(fmt)) + "\n";
 
-    s += "#extension GL_EXT_shader_8bit_storage : require\n"
-         "#extension GL_EXT_shader_16bit_storage : require\n"
-         "#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require\n"
-         "#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require\n";
-    if (isHalf)
-        s += "#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require\n";
+    std::string s = "#version 460\n" + glslTypePreamble(isHalf) + defs;
 
     s += "\nlayout(local_size_x = " + std::to_string(simpleLocalSize) +
          ", local_size_y = " + std::to_string(simpleLocalSize) + ") in;\n\n"
@@ -1172,19 +1361,9 @@ inline std::string simpleSource(const SimpleFilter &sf, const VSVideoFormat &fmt
          "    if (pos < 0) pos = -pos - 1;\n"
          "    else if (pos >= len) pos = 2 * len - 1 - pos;\n"
          "    return clamp(pos, 0, len - 1);\n"
-         "}\n"
-         /* Vulkan specifies sqrt to 3 ulp where the scalar paths this is checked against get a
-            correctly rounded SQRTSS. One Newton step recovers the difference: fma computes the
-            residual s - y*y exactly, so the correction is good to well under an ulp of y. Two
-            flops on top of a square root, and unlike an fp64 root it asks nothing of the
-            device, so it is the default. */
-         "float vsSqrt(float s) {\n"
-         "    float y = sqrt(s);\n"
-         "    if (!(y > 0.0) || isinf(y)) return y;\n"
-         "    precise float r = fma(-y, y, s);\n"
-         "    return y + r / (y + y);\n"
-         "}\n"
-         "#define MX(xx) uint(vsMirror((xx), int(pc.width)))\n"
+         "}\n";
+    s += glslVsSqrt;
+    s += "#define MX(xx) uint(vsMirror((xx), int(pc.width)))\n"
          "#define MY(yy) uint(vsMirror((yy), int(pc.height)))\n";
     /* SRCn and MSRCn bound against the plane being written, which is the same plane a
        filter that does not move pixels is reading. GSRCn bounds against the source instead,
@@ -1259,7 +1438,15 @@ inline VSNode *createSimpleFilter(const SimpleFilter &sf, VSNode * const *nodes,
 
     desc.finishFrame = sf.finishFrame;
     desc.mapFrame = sf.mapFrame;
-    desc.prepareFrame = sf.prepareFrame;
+    /* Adapted rather than assigned: the scratch handoff is a FilterDesc tier feature no
+       SimpleFilter needs, so their prepareFrame keeps the shorter signature. */
+    if (sf.prepareFrame) {
+        const auto prepare = sf.prepareFrame;
+        desc.prepareFrame = [prepare](int n, const VSFrame *const *sources, int numSources,
+            const VSAPI *vsapi, uint32_t *params, std::vector<uint8_t> &, std::string &error) {
+            return prepare(n, sources, numSources, vsapi, params, error);
+        };
+    }
     desc.frameParamCount = sf.frameParamCount;
 
     const auto fillParams = sf.fillParams;

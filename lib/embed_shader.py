@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Wrap shader.comp in a raw string literal, for compilers without C23 #embed.
 
-The output must declare exactly what the #embed path declares -- const char knlmGlsl[],
-NUL terminated -- so knlmvulkan.cpp compiles identically through either route. The file is
-only rewritten when its content changes, so an untouched shader never dirties the build.
+The output must provide what the #embed path provides -- knlmGlsl, usable as a NUL
+terminated const char * -- so knlmvulkan.cpp compiles identically through either route.
+The file is only rewritten when its content changes, so an untouched shader never dirties
+the build.
 """
 import sys
 

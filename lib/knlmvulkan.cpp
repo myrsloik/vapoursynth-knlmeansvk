@@ -8,10 +8,11 @@
  * version 3 of the License, or (at your option) any later version.
  *
  * Non-local means denoising on the VapourSynth Vulkan GPU API (API 4.3), built on the
- * core's declaration driver; gpufilter.h is copied beside this file, as its header
- * instructs. The kernels in shader.comp are a port of the OpenCL kernels and keep their
- * decomposition: per-offset pixel distances, a separable box filter turning them into
- * patch distances, symmetric pair accumulation, then one weighted average.
+ * core's declaration driver; gpufilter.h and the vsgpuglsl.h it includes are copied
+ * beside this file, as its header instructs. The kernels in shader.comp are a port of the
+ * OpenCL kernels and keep their decomposition: per-offset pixel distances, a separable
+ * box filter turning them into patch distances, symmetric pair accumulation, then one
+ * weighted average.
  *
  * What the core replaces from the OpenCL implementation: device enumeration and selection
  * (device_type/device_id/ocl_* are gone, the core owns one device), the command queue and
@@ -69,13 +70,17 @@ namespace {
 #endif
 
 #ifdef KNLMVK_HAVE_EMBED
-const char knlmGlsl[] = {
+/* Unsigned, because #embed expands to int literals and a braced initializer refuses to
+   narrow a value above 127 into a signed char: one non-ASCII character in a shader
+   comment would stop this route compiling. The raw string route has no such rule. */
+const unsigned char knlmGlslBytes[] = {
 #  pragma clang diagnostic push
 #  pragma clang diagnostic ignored "-Wc23-extensions"
 #embed "shader.comp"
 #  pragma clang diagnostic pop
     , '\0'
 };
+const char *const knlmGlsl = reinterpret_cast<const char *>(knlmGlslBytes);
 #else
 #  include "shader_comp.h"
 #endif
@@ -114,24 +119,16 @@ struct PMeta {
     std::vector<std::array<int, 3>> pairs; /* search rounds: their (qx, qy, qk) */
 };
 
+/* The sample type spelling and the extension block come from the core's shared helpers,
+   so they cannot drift from what every in-tree kernel declares. */
 std::string composeKernel(int kernel, int channels, const VSVideoFormat &fmt) {
     const bool isFloat = fmt.sampleType == stFloat;
-    const bool isHalf = isFloat && fmt.bytesPerSample == 2;
-    const char *sampleType = isFloat ? (isHalf ? "float16_t" : "float")
-                                     : (fmt.bytesPerSample == 1 ? "uint8_t" : "uint16_t");
-    std::string s =
-        "#version 460\n"
-        "#extension GL_EXT_shader_8bit_storage : require\n"
-        "#extension GL_EXT_shader_16bit_storage : require\n"
-        "#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require\n"
-        "#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require\n";
-    if (isHalf)
-        s += "#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require\n";
+    std::string s = "#version 460\n" + vsgpu::glslTypePreamble(vsgpu::glslUsesFloat16(fmt));
     s += "#define KNLM_KERNEL " + std::to_string(kernel) + "\n" +
         "#define KNLM_CHANNELS " + std::to_string(channels) + "\n" +
         "#define KNLM_FMT_FLOAT " + (isFloat ? "1" : "0") + "\n" +
         "#define KNLM_MAX_BATCH " + std::to_string(maxBatch) + "\n" +
-        "#define SAMPLE_T " + sampleType + "\n";
+        "#define SAMPLE_T " + vsgpu::glslElementType(fmt) + "\n";
     s += knlmGlsl;
     return s;
 }
@@ -315,16 +312,9 @@ static void VS_CC KNLMeansCreate(const VSMap *in, VSMap *out, void *, VSCore *co
         batch = std::clamp(std::atoi(forced), 1, maxBatch);
     const int pairsMax = static_cast<int>(std::min<size_t>(batch, offsets.size()));
 
-    /* The kernels index scratch with 32-bit ints, so the largest buffer -- the stack,
-       or U4 for a tiny 'd' with a big batch -- must stay under 2^31 floats. Nothing
-       reasonable comes near it (8K RGB needs d > 10, at 8 GB of scratch per frame), so
-       this only turns a silent wraparound into a message. */
-    {
-        const VkDeviceSize planeElems = static_cast<VkDeviceSize>(scrStride) * procH;
-        const VkDeviceSize largest = std::max<VkDeviceSize>(T * C, 2 * pairsMax) * planeElems;
-        if (largest >= (VkDeviceSize(1) << 31))
-            return fail("the frame size and 'd' together need a scratch buffer of more than 2^31 elements");
-    }
+    /* The kernels index scratch with 32-bit ints. Nothing here has to guard that: the
+       driver refuses any scratch buffer past what one storage binding may cover on the
+       device, a 32-bit byte count, so every buffer it does bind stays under 2^30 floats. */
 
     /* Output rows per thread in the weight kernel: the more a tile covers, the less of
        its halo is recomputed border, but the more shared memory a workgroup holds and so
@@ -512,7 +502,7 @@ static void VS_CC KNLMeansCreate(const VSMap *in, VSMap *out, void *, VSCore *co
     const int numFrames = vi->numFrames;
     desc.frameParamCount = 1;
     desc.prepareFrame = [dTmp, numFrames](int n, const VSFrame *const *, int, const VSAPI *,
-        uint32_t *params, std::string &) {
+        uint32_t *params, std::vector<uint8_t> &, std::string &) {
         params[0] = static_cast<uint32_t>(std::min({ dTmp, n, numFrames - 1 - n }));
         return true;
     };

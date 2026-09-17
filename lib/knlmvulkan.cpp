@@ -192,10 +192,14 @@ static void VS_CC KNLMeansCreate(const VSMap *in, VSMap *out, void *, VSCore *co
     if (err)
         wref = 1.0;
 
-    if (dTmp < 0)
-        return fail("'d' must be greater than or equal to 0");
-    if (aTmp < 1)
-        return fail("'a' must be greater than or equal to 1");
+    /* Both radii are capped directly: every output frame holds 2d+1 source frames and the
+       stack for them, and the offset count below squares 2a+1, so an unbounded value ends
+       in exhausted memory or a wrapped product rather than a message. The caps sit far
+       past the useful range (the defaults are 1 and 2). */
+    if (dTmp < 0 || dTmp > 64)
+        return fail("'d' must be in range [0, 64]");
+    if (aTmp < 1 || aTmp > 128)
+        return fail("'a' must be in range [1, 128]");
     if (sTmp < 0 || sTmp > 8)
         return fail("'s' must be in range [0, 8]");
     /* Negated comparisons so NaN fails too; NaN in either would make every output NaN. */

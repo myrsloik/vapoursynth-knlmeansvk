@@ -38,9 +38,10 @@ knlmvk.KNLMeans(clip clip[, int d=1, int a=2, int s=4, float h=1.2, string chann
 
 - **clip**: the input clip. Gray, YUV or RGB; 8-16 bit integer, half or single precision
   float. Frame properties are copied from it.
-- **d**: temporal radius; frames `[n-d, n+d]` take part in the search. `d=0` is purely
-  spatial.
-- **a**: spatial search radius; the search window is `(2a+1)x(2a+1)x(2d+1)`.
+- **d**: temporal radius, in `[0, 64]`; frames `[n-d, n+d]` take part in the search.
+  `d=0` is purely spatial.
+- **a**: spatial search radius, in `[1, 128]`; the search window is
+  `(2a+1)x(2a+1)x(2d+1)`.
 - **s**: similarity neighbourhood (patch) radius, in `[0, 8]`; patches are
   `(2s+1)x(2s+1)`.
 - **h**: filtering strength, on a 0-255 scale regardless of bit depth. Larger values

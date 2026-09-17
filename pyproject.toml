@@ -1,12 +1,6 @@
 [build-system]
-requires = [
-    "hatchling>=1.27.0",
-    "vapoursynth>=80",
-    "meson",
-    "ninja",
-    "packaging",
-]
-build-backend = "hatchling.build"
+requires = ["meson-python", "vapoursynth>=80"]
+build-backend = "mesonpy"
 
 [project]
 name = "vapoursynth-knlmeansvk"
@@ -22,29 +16,13 @@ maintainers = [
 ]
 dependencies = ["vapoursynth>=80"]
 
-[dependency-groups]
-dev = ["hatchling>=1.27.0", "packaging"]
-
 [project.urls]
 "Source Code" = "https://github.com/Jaded-Encoding-Thaumaturgy/vapoursynth-knlmeansvk"
 "Bug Tracker" = "https://github.com/Jaded-Encoding-Thaumaturgy/vapoursynth-knlmeansvk/issues"
 "Changelog" = "https://github.com/Jaded-Encoding-Thaumaturgy/vapoursynth-knlmeansvk/blob/master/CHANGELOG"
 "Contact" = "https://discord.gg/XTpc6Fa9eB"
 
-[tool.hatch.version]
-path = "meson.build"
-pattern = "version\\s*:\\s*'(?P<version>\\d+\\.\\d+)'"
-
-[tool.hatch.build.targets.sdist]
-include = ["lib", "meson.build", "meson_options.txt"]
-
-[tool.hatch.build.targets.wheel]
-include = ["vapoursynth/plugins"]
-artifacts = [
-    "vapoursynth/plugins/*.dylib",
-    "vapoursynth/plugins/*.so",
-    "vapoursynth/plugins/*.dll",
-]
-
-[tool.hatch.build.targets.wheel.hooks.custom]
-path = "hatch_build.py"
+# The import library meson installs beside the DLL on Windows is for linking against the
+# module, which nothing does; VapourSynth only loads the DLL.
+[tool.meson-python.wheel]
+exclude = ["*/*.dll.a", "*/*.lib"]

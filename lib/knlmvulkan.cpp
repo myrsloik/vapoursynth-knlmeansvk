@@ -210,16 +210,15 @@ static void VS_CC KNLMeansCreate(const VSMap *in, VSMap *out, void *, VSCore *co
     if (!(wref >= 0.0))
         return fail("'wref' must be greater than or equal to 0");
 
-    /* Every search offset becomes a pass list entry copied into two per-pass records, so
-       an absurd window would eat host memory and creation time rather than fail. A
-       million offsets is far beyond any useful setting (the defaults give 37) and still
-       bounded; arithmetic in 64 bits since (2a+1)^2 overflows int at a = 23170. */
+    /* Inside the caps a window can still reach (257 x 257 x 129) / 2 offsets, and every
+       offset becomes a pass list entry copied into two per-pass records, so the count is
+       bounded as well. A million is far beyond any useful setting (the defaults give 37). */
     {
-        const int64_t side = 2 * static_cast<int64_t>(aTmp) + 1;
-        const int64_t numOffsets = (side * side * (2 * static_cast<int64_t>(dTmp) + 1) - 1) / 2;
-        if (numOffsets > (int64_t(1) << 20))
+        const int side = 2 * aTmp + 1;
+        const int numOffsets = (side * side * (2 * dTmp + 1) - 1) / 2;
+        if (numOffsets > (1 << 20))
             return fail("'a' and 'd' give " + std::to_string(numOffsets) +
-                " search offsets; the limit is " + std::to_string(int64_t(1) << 20));
+                " search offsets; the limit is " + std::to_string(1 << 20));
     }
 
     auto chanIs = [&](const char *what) {

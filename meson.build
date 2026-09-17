@@ -26,6 +26,15 @@ if vs_include == ''
   vs_include = r.stdout().strip()
 endif
 
+# The plugin installs into the Python package's plugin directory, where the package's
+# VapourSynth autoloads from. Spelled through the python module rather than as a path so
+# meson-python recognises it as platlib and places it in the wheel; -Dplugindir overrides
+# it for a plain meson install into some other VapourSynth.
+plugindir = get_option('plugindir')
+if plugindir == ''
+  plugindir = py.get_install_dir() / 'vapoursynth/plugins'
+endif
+
 # Only the Vulkan headers are needed: the plugin never links the loader, the VapourSynth
 # core hands it every entry point already resolved.
 deps = []
@@ -63,7 +72,9 @@ shader_header = custom_target(
   command: [py, files('lib/embed_shader.py'), '@INPUT@', '@OUTPUT@'],
 )
 
-library(
+# A module rather than a library: the core loads it with dlopen/LoadLibrary and nothing
+# links against it, so it carries no soname and no import library.
+shared_module(
   'knlmvulkan',
   ['lib/knlmvulkan.cpp', shader_header],
   include_directories: inc_dirs,
@@ -73,5 +84,6 @@ library(
   cpp_args: ['-DKNLMVK_NO_EMBED', '-D_CRT_SECURE_NO_WARNINGS'],
   link_args: link_args,
   gnu_symbol_visibility: 'hidden',
-  install: false,
+  install: true,
+  install_dir: plugindir,
 )

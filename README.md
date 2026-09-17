@@ -28,7 +28,9 @@ CPU clip passed to it is uploaded automatically.
 pip install vapoursynth-knlmeansvk
 ```
 
-The wheel installs the plugin into VapourSynth's Python package plugin directory.
+The wheel installs the plugin into VapourSynth's Python package plugin directory, where
+it autoloads. Wheels exist for Windows (x64), Linux (x86_64 and aarch64) and macOS (Intel
+and Apple silicon).
 
 ## Usage
 
@@ -102,18 +104,23 @@ already resolved.
 ```bash
 meson setup build
 meson compile -C build
+meson install -C build
 ```
 
 If the headers are not found automatically, pass
 `-Dvapoursynth_include=/path/to/vapoursynth/include` and/or
 `-Dvulkan_include=/path/to/vulkan/include`.
 
-The compiled plugin (`libknlmvulkan.so`, `knlmvulkan.dll` or `libknlmvulkan.dylib`) lands
-in the build directory; copy it to your VapourSynth plugins directory. The compute kernel
-is embedded with C23 `#embed` where the compiler supports it (clang 19+, gcc 15+) and
-through a meson-generated header otherwise, so MSVC builds without a separate step.
+`meson install` puts the plugin in the `vapoursynth` Python package's plugin directory;
+`-Dplugindir=/path` sends it somewhere else, such as `lib/vapoursynth` of a system
+VapourSynth. The compiled plugin (`libknlmvulkan.so`, `knlmvulkan.dll` or
+`libknlmvulkan.dylib`) also sits in the build directory for copying by hand. The compute
+kernel is embedded with C23 `#embed` where the compiler supports it (clang 19+, gcc 15+)
+and through a meson-generated header otherwise, so MSVC builds without a separate step.
 
-Wheels build with [uv](https://github.com/astral-sh/uv): `uv build --wheel`.
+Wheels come from the same meson build through
+[meson-python](https://mesonbuild.com/meson-python/): `uv build` or
+`python -m build`, with meson options passed as `-Csetup-args=-Doption=value`.
 
 ## License
 

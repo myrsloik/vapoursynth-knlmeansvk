@@ -2,6 +2,10 @@ name: Build
 
 on: [push, pull_request, workflow_dispatch]
 
+# meson-python tags a wheel that carries anything in platlib for the CPython it was built
+# with, and the plugin is loaded by VapourSynth rather than imported, so every job retags
+# its wheel py3-none-<platform> and one wheel per platform serves every Python.
+
 jobs:
   build-non-windows-wheel:
     strategy:
@@ -22,6 +26,9 @@ jobs:
     steps:
     - uses: actions/checkout@v7
 
+    # The Linux wheels are built inside cibuildwheel's manylinux containers and repaired by
+    # auditwheel, which is what makes them installable on distributions older than the
+    # runner; macOS has no container and builds on the host.
     - uses: pypa/cibuildwheel@v4.1.0
       env:
         CIBW_BUILD: cp314-*
@@ -36,8 +43,10 @@ jobs:
         CIBW_BEFORE_ALL_MACOS: >
           rm -rf /tmp/vulkan-headers &&
           git clone --depth 1 https://github.com/KhronosGroup/Vulkan-Headers.git /tmp/vulkan-headers
-        CIBW_ENVIRONMENT_LINUX: MESON_ARGS="-Dstatic=true -Dvulkan_include=/opt/vulkan-headers/include"
-        CIBW_ENVIRONMENT_MACOS: MESON_ARGS="-Dvulkan_include=/tmp/vulkan-headers/include" MACOSX_DEPLOYMENT_TARGET=15
+        # Static runtimes on Linux, so the binary depends on nothing beyond glibc.
+        CIBW_CONFIG_SETTINGS_LINUX: setup-args=-Dstatic=true setup-args=-Dvulkan_include=/opt/vulkan-headers/include
+        CIBW_CONFIG_SETTINGS_MACOS: setup-args=-Dvulkan_include=/tmp/vulkan-headers/include
+        CIBW_ENVIRONMENT_MACOS: MACOSX_DEPLOYMENT_TARGET=15
         # No manylinux image pin: cibuildwheel then builds in the image whose policy it also
         # repairs against, so the two cannot disagree. Pinning one to manylinux_2_34 produced a
         # binary auditwheel rejected for referencing symbols newer than that policy allows.
@@ -45,6 +54,13 @@ jobs:
       with:
         output-dir: dist
         extras: uv
+
+    - name: Fix tag
+      run: |
+        cd dist
+        for whl in *.whl; do
+          pipx run wheel tags --remove --python-tag py3 --abi-tag none $whl
+        done
 
     - uses: actions/upload-artifact@v7
       with:
@@ -67,14 +83,17 @@ jobs:
       run: git clone --depth 1 https://github.com/KhronosGroup/Vulkan-Headers.git "$env:RUNNER_TEMP\vulkan-headers"
 
     # b_vscrt=mt so the plugin carries no dependency on the redistributable runtime. Forward
-    # slashes because hatch_build.py splits MESON_ARGS with shlex in POSIX mode, where a
-    # backslash is an escape character and a Windows path silently loses its separators;
-    # meson accepts either form.
+    # slashes so the path survives every layer between here and meson, which accepts either
+    # form.
     - name: Build
       run: |
         $vulkanInclude = "$env:RUNNER_TEMP\vulkan-headers\include".Replace('\', '/')
-        $env:MESON_ARGS = "-Db_vscrt=mt -Dvulkan_include=$vulkanInclude"
-        uv build
+        uv build -Csetup-args="-Db_vscrt=mt" -Csetup-args="-Dvulkan_include=$vulkanInclude"
+
+    - name: Fix tag
+      run: |
+        cd dist
+        Get-ChildItem *.whl | ForEach-Object { uvx wheel tags --remove --python-tag py3 --abi-tag none $_.Name }
 
     - uses: actions/upload-artifact@v7
       with:

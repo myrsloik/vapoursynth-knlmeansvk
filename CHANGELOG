@@ -11,6 +11,8 @@ v2.0
     serializing through one command queue.
   - Remove the 8192x8192 resolution limit and the OpenCL/Boost build dependencies; only
     the Vulkan headers are needed to compile.
+  - Wheels are built by meson-python straight from the meson build, which also installs
+    the plugin on its own.
 
 v1.3
   - Improve device selection logic.
